@@ -1,0 +1,211 @@
+from db/rowquill import Schema;
+from std/data/json import JSON;
+from std/db import DB;
+from test/more import *;
+
+const schema := new Schema( dbh: DB.temp() );
+const test_codec := new JSON();
+
+schema.get_dbh().prepare("""
+	CREATE TABLE department (
+		id int PRIMARY KEY,
+		name varchar(200)
+	);
+""").execute();
+
+schema.add_table( "department", function ( tab ) {
+	tab.add_column( "id", "int", primary: true );
+	tab.add_column( "name", "varchar", "length": 200, required: true );
+	tab.has_many(
+		accessor: "employees",
+		table:    "employee",
+		join:     "my.id = their.dept",
+	);
+} );
+
+schema.get_dbh().prepare("""
+	CREATE TABLE employee (
+		id int PRIMARY KEY,
+		fullname varchar(200),
+		date_of_birth varchar(10),
+		dept int REFERENCES department(id),
+		extra_data text
+	);
+""").execute();
+
+schema.add_table( "employee", function ( tab ) {
+	const codec := new JSON();
+	tab.add_column(
+		"id",
+		"int",
+		primary: true,
+		validate: fn val → val ≥ 0,
+	);
+	tab.add_column(
+		"fullname",
+		"varchar",
+		"length": 200,
+		required: true,
+		accessor: "name",
+	);
+	tab.add_column(
+		"date_of_birth",
+		"varchar",
+		"length": 10,
+		pattern: /^[0-9]{4}-[0-9]{2}-[0-9]{2}/,
+	);
+	tab.add_column( "dept", "int", references: "department.id" );
+	tab.add_column(
+		"extra_data",
+		"text",
+		inflate: function ( text ) {
+			return {} if not text;
+			return codec.decode(text);
+		},
+		deflate: function ( data ) {
+			return codec.encode( data ?: {} );
+		},
+	);
+	tab.has_one(
+		accessor: "department",
+		table:    "department",
+		join:     "my.dept = their.id",
+	);
+} );
+
+let accounts := schema.table("department").create(
+	id: 3,
+	name: "Accounts",
+);
+is( accounts{in_database}, false, "new rows start outside the database" );
+accounts.insert();
+is( accounts{in_database}, true, "insert marks rows as database backed" );
+
+like(
+	exception( function () {
+		schema.table("employee").create( fullname: null );
+	} ),
+	/Column fullname is required/,
+	"required columns reject null in setters",
+);
+
+like(
+	exception( function () {
+		schema.table("employee").create( id: 43 ).insert();
+	} ),
+	/Column fullname is required/,
+	"required columns are checked before insert",
+);
+
+like(
+	exception( function () {
+		schema.table("employee").create( id: -1 );
+	} ),
+	/Column id failed validation/,
+	"validators are checked in setters",
+);
+
+like(
+	exception( function () {
+		schema.table("employee").create( date_of_birth: "not-a-date" );
+	} ),
+	/Column date_of_birth does not match pattern/,
+	"patterns are checked in setters",
+);
+
+let bob := schema.table("employee").create( fullname: "Bob" );
+bob.id( set: 42 );
+bob.dept( set: 3 );
+bob.extra_data( set: { "likes": "tea", "score": 7 } );
+
+is(
+	bob.extra_data(),
+	{ "likes": "tea", "score": 7 },
+	"inflated accessors return application values",
+);
+ok( bob.extra_data( raw: true ) instanceof String, "raw accessors return text" );
+is(
+	test_codec.decode( bob.extra_data( raw: true ) ),
+	{ "likes": "tea", "score": 7 },
+	"raw accessors return stored JSON values",
+);
+ok( bob{column_data}{extra_data} instanceof String, "column_data stores raw text" );
+is(
+	test_codec.decode( bob{column_data}{extra_data} ),
+	{ "likes": "tea", "score": 7 },
+	"column_data stores raw JSON values",
+);
+
+bob.insert();
+is( bob{dirty}, {}, "insert clears dirty fields" );
+
+let bob2 := schema.table("employee").find(42);
+ok( bob2, "find returns a row object" );
+is( bob2.name(), "Bob", "find inflates a database row" );
+is(
+	bob2.extra_data(),
+	{ "likes": "tea", "score": 7 },
+	"find supports inflated columns",
+);
+
+bob2.fullname( set: "Robert" );
+bob2.date_of_birth( set: "1980-01-02" );
+bob2.extra_data( set: "{\"likes\":\"coffee\",\"score\":8}", raw: true );
+bob2.update();
+is( bob2{dirty}, {}, "update clears dirty fields" );
+
+let bob3 := schema.table("employee").find( [ 42 ] );
+is( bob3.name(), "Robert", "update writes changed values" );
+is(
+	bob3.extra_data(),
+	{ "likes": "coffee", "score": 8 },
+	"raw setter data is inflated after update and find",
+);
+
+is(
+	bob3.department().name(),
+	"Accounts",
+	"has_one returns the related row",
+);
+is(
+	accounts.employees().map( fn employee → employee.name() ),
+	[ "Robert" ],
+	"has_many returns related rows",
+);
+
+is(
+	schema.table("employee").search( name: "Robert" ).length(),
+	1,
+	"search supports equality and accessor names",
+);
+is(
+	schema.table("employee").search( name: [ "LIKE", "%obert" ] ).length(),
+	1,
+	"search supports operator conditions",
+);
+is(
+	schema.table("employee").search(
+		NOT: { name: "Alice" },
+	).length(),
+	1,
+	"search supports NOT groups",
+);
+is(
+	schema.table("employee").search(
+		OR: [
+			{ name: [ "LIKE", "%obert" ] },
+			{ AND: [
+				{ dept: null },
+				{ date_of_birth: [ ">=", "1980" ] },
+			] },
+		],
+	).length(),
+	1,
+	"search supports nested OR and AND groups",
+);
+
+bob3.delete();
+is( bob3{in_database}, false, "delete marks rows as not database backed" );
+is( schema.table("employee").find(42), null, "delete removes the row" );
+
+done_testing();
