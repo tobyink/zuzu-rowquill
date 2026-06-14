@@ -23,7 +23,7 @@ db/rowquill - Small row-object ORM for ZuzuScript.
 
 =head1 DESCRIPTION
 
-C<db/rowquill> is a proof-of-concept row-object mapper. A C<Schema>
+C<db/rowquill> is a small row-object ORM for ZuzuScript. A C<Schema>
 wraps a C<std/db> database handle and builds one generated class per
 table. Generated row classes support C<create>, C<find>, C<search>,
 C<insert>, C<update>, C<delete>, column accessors, inflate/deflate
