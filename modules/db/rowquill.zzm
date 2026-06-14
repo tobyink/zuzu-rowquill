@@ -31,6 +31,14 @@ callbacks, validation, and simple C<has_one> and C<has_many>
 relationships. Table builders can also add custom row helper methods
 and static table-class helper methods.
 
+=head2 Schema Helpers
+
+C<Schema.has_table> checks whether a table has been registered, and
+C<Schema.table_names> returns the registered table names. C<Schema.find>,
+C<Schema.search>, C<Schema.create>, and C<Schema.insert> are convenience
+wrappers around the generated table class for cases where the table name is
+dynamic.
+
 =head2 Searching
 
 C<search> accepts named column conditions. Operator conditions are arrays
@@ -149,6 +157,32 @@ class Schema {
 	method table ( String tablename ) {
 		die `No such table: ${tablename}` if not _tables.exists(tablename);
 		return self{_tables}{(tablename)};
+	}
+
+	method has_table ( String tablename ) {
+		return _tables.exists(tablename);
+	}
+
+	method table_names () {
+		return _tables.to_Array().map( fn pair → pair.key );
+	}
+
+	method find ( String tablename, pkey ) {
+		return self.table(tablename).find(pkey);
+	}
+
+	method search ( String tablename, ... PairList conditions ) {
+		return self.table(tablename).search( ...conditions );
+	}
+
+	method create ( String tablename, ... PairList opts ) {
+		return self.table(tablename).create( ...opts );
+	}
+
+	method insert ( String tablename, ... PairList opts ) {
+		let row := self.create( tablename, ...opts );
+		row.insert();
+		return row;
 	}
 
 	method _exec_sql ( String sql ) {

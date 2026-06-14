@@ -121,6 +121,15 @@ schema.add_table( "employee", function ( tab ) {
 	} );
 } );
 
+is( schema.has_table("department"), true, "has_table finds registered tables" );
+is( schema.has_table("missing"), false, "has_table rejects unknown tables" );
+is( schema.table_names().length(), 2, "table_names returns registered tables" );
+is(
+	schema.table_names().grep( fn name → name eq "employee" ).length(),
+	1,
+	"table_names includes employee",
+);
+
 let accounts := schema.table("department").create(
 	id: 3,
 	company: "ACME",
@@ -389,6 +398,31 @@ is( schema.table("employee").first( name: "Robert" ).id(), 42, "first returns a 
 is( schema.table("employee").count( kind: "seed" ), 3, "count returns matching rows" );
 is( schema.table("employee").exists( name: "Robert" ), true, "exists returns true" );
 is( schema.table("employee").exists( name: "Nobody" ), false, "exists returns false" );
+is( schema.find( "employee", 42 ).name(), "Robert", "schema find delegates" );
+is(
+	schema.search( "employee", name: [ "ILIKE", "%robert%" ] ).length(),
+	1,
+	"schema search delegates",
+);
+let schema_created := schema.create(
+	"employee",
+	id: 62,
+	fullname: "Schema Created",
+	email: "schema-created@example.com",
+);
+is( schema_created{in_database}, false, "schema create returns a new row" );
+let schema_inserted := schema.insert(
+	"employee",
+	id: 63,
+	fullname: "Schema Inserted",
+	email: "schema-inserted@example.com",
+);
+is( schema_inserted{in_database}, true, "schema insert writes a new row" );
+is(
+	schema.find( "employee", 63 ).name(),
+	"Schema Inserted",
+	"schema insert row can be found",
+);
 
 let found_or_created := schema.table("employee").find_or_create(
 	find: { id: 60 },

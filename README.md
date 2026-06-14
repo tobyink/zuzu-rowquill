@@ -103,7 +103,37 @@ say( bob.is_accountant() );          // true
 - Assigning `has_one` relationships with `relationship(set: row)`.
 - Custom row helper methods and static table-class methods.
 - Lifecycle hooks for insert, update, and delete.
+- Schema registry helpers: `has_table` and `table_names`.
+- Schema-level `create`, `find`, `search`, and `insert` shortcuts for
+  dynamic table names.
 - `Schema.transaction` with nested transaction savepoints.
+
+## Schema Helpers
+
+`has_table` checks whether a table has been registered. `table_names`
+returns the registered table names.
+
+```zzs
+if ( schema.has_table("employee") ) {
+	say( schema.table_names() );
+}
+```
+
+When the table name is dynamic, `Schema` also provides shortcuts for common
+table-class operations.
+
+```zzs
+let employee_table := "employee";
+let bob := schema.insert(
+	employee_table,
+	id: 42,
+	name: "Bob",
+);
+
+schema.find( employee_table, 42 );
+schema.search( employee_table, name: [ "LIKE", "B%" ] );
+schema.create( employee_table, id: 43, name: "Alice" );
+```
 
 ## Searching
 
