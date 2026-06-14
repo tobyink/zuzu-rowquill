@@ -1,0 +1,1041 @@
+trait TableClass {
+	method _table_class () {
+		return self.get_schema().table( self.get_table_name() );
+	}
+
+	method _column ( String col ) {
+		for ( let c in self.get_column_metadata() ) {
+			return c if c{name} eq col;
+			return c if c.get( "accessor", "" ) eq col;
+		}
+		die "No such column: " _ col;
+	}
+
+	method _inflate_column ( String col, value ) {
+		let c := self._column(col);
+		return c{inflate}(value) if c.exists("inflate");
+		return value;
+	}
+
+	method _deflate_column ( String col, value ) {
+		let c := self._column(col);
+		return c{deflate}(value) if c.exists("deflate");
+		return value;
+	}
+
+	method _validate_column ( String col, value, raw_value ) {
+		let c := self._column(col);
+		if ( c.get( "required", false ) and raw_value ≡ null ) {
+			die "Column " _ col _ " is required";
+		}
+
+		for ( let max_length in c.get_all("length") ) {
+			if ( length raw_value > max_length ) {
+				die "Column " _ col _
+					" exceeds maximum length " _ max_length;
+			}
+		}
+
+		for ( let pattern in c.get_all("pattern") ) {
+			if ( not ( raw_value ~ pattern ) ) {
+				die "Column " _ col _ " does not match pattern";
+			}
+		}
+
+		for ( let validator in c.get_all("validate") ) {
+			if ( not validator(value) ) {
+				die "Column " _ col _ " failed validation";
+			}
+		}
+
+		return true;
+	}
+
+	method _set_column ( String col, value, Boolean raw := false ) {
+		let c := self._column(col);
+		if ( c.get( "readonly", false ) and self{in_database} ) {
+			die "Column " _ col _ " is read-only";
+		}
+		let raw_value := raw
+			? value
+			: self._deflate_column( c{name}, value );
+		let validators := c.get_all("validate");
+		let value_for_validation := raw and validators.length()
+			? self._inflate_column( c{name}, raw_value )
+			: value;
+		self._validate_column(
+			c{name},
+			value_for_validation,
+			raw_value
+		);
+		self{column_data}{(c{name})} := raw_value;
+		self{dirty}{(c{name})} := true;
+		return self;
+	}
+
+	method _get_column ( String col, Boolean raw := false ) {
+		let value := self{column_data}{(col)};
+		return raw ? value : self._inflate_column( col, value );
+	}
+
+	method _relationship_conditions ( rel ) {
+		let conditions := {};
+		for ( let pair in rel{join}.to_Array() ) {
+			let local_col := self._column(pair.key){name};
+			let value := self._get_column(local_col);
+			return null if value ≡ null;
+			conditions{(pair.value)} := value;
+		}
+		if ( rel.exists("where") ) {
+			return { AND: [ conditions, rel{where} ] };
+		}
+		return conditions;
+	}
+
+	method _set_relationship ( rel, related ) {
+		die "Cannot set has_many relationship " _ rel{accessor}
+			if rel{type} eq "has_many";
+		die "Cannot set narrowed relationship " _ rel{accessor}
+			if rel.exists("where");
+		for ( let pair in rel{join}.to_Array() ) {
+			let local_col := self._column(pair.key){name};
+			let related_col := related._column(pair.value){name};
+			self._set_column(
+				local_col,
+				related._get_column( related_col )
+			);
+		}
+		return self;
+	}
+
+	method _validate_database_constraints ( Array cols ) {
+		for ( let col in cols ) {
+			let c := self._column(col);
+			let value := self{column_data}.get( c{name}, null );
+			next if value ≡ null;
+
+			if ( c.get( "unique", false ) ) {
+				self._validate_unique_column(c, value);
+			}
+			if ( c.exists("exists_in") ) {
+				self._validate_exists_in(c, value);
+			}
+		}
+		return true;
+	}
+
+	method _validate_required_columns_for_write () {
+		for ( let c in self.get_column_metadata() ) {
+			let col := c{name};
+			if ( c.get( "required", false ) ) {
+				if (
+					not self{column_data}.exists(col)
+					or self{column_data}{(col)} ≡ null
+				) {
+					die "Column " _ col _ " is required";
+				}
+			}
+		}
+		return true;
+	}
+
+	method _has_one ( rel ) {
+		let conditions := self._relationship_conditions(rel);
+		return null if conditions ≡ null;
+		let rows := self.get_schema()
+			.table(rel{table})
+			._search_run(conditions, {});
+		return rows[0] if rows.length() > 0;
+		return null;
+	}
+
+	method _has_many ( rel ) {
+		let conditions := self._relationship_conditions(rel);
+		return [] if conditions ≡ null;
+		return self.get_schema()
+			.table(rel{table})
+			._search_run(conditions, {});
+	}
+
+	method _apply_defaults () {
+		for ( let c in self.get_column_metadata() ) {
+			next if not c.exists("default");
+			next if self{column_data}.exists(c{name});
+			let value := c{default} instanceof Function
+				? c{default}(self)
+				: c{default};
+			self._set_column( c{name}, value );
+		}
+		return self;
+	}
+
+	method _run_hooks ( String name ) {
+		for ( let hook in self.get_hook_metadata(){(name)} ) {
+			hook(self);
+		}
+		return self;
+	}
+
+	method _validate_unique_column ( column, value ) {
+		from std/string import join, sprint;
+		let binds := [ value ];
+		let where := [
+			self._table_class()._sql_identifier(column{name}) _ "=?",
+		];
+		if ( self{in_database} ) {
+			for ( let pkey_name in self._table_class()._primary_key_names() ) {
+				die "Missing primary key value for " _ pkey_name
+					if not self{column_data}.exists(pkey_name);
+				where.push(
+					self._table_class()._sql_identifier(pkey_name) _ "!=?"
+				);
+				binds.push( self{column_data}{(pkey_name)} );
+			}
+		}
+		let sql := sprint(
+			"SELECT 1 AS found FROM %s WHERE %s",
+			self._table_class()._sql_table(),
+			join( " AND ", where ),
+		);
+		let sth := self.get_schema().get_dbh().prepare(sql);
+		sth.execute( ... binds );
+		die "Column " _ column{name} _ " must be unique"
+			if sth.next_typed_dict();
+		return true;
+	}
+
+	method _validate_exists_in ( column, value ) {
+		from std/string import split, sprint;
+		let spec := column{exists_in};
+		let parts := split( spec, ".", 2 );
+		die "Column " _ column{name} _
+			" exists_in must be table.column"
+			if parts.length() ≢ 2
+			or not ( parts[0] ~ /^[A-Za-z_][A-Za-z0-9_]*$/ )
+			or not ( parts[1] ~ /^[A-Za-z_][A-Za-z0-9_]*$/ );
+		let tab := parts[0];
+		let col := parts[1];
+		let sql := sprint(
+			"SELECT 1 AS found FROM %s WHERE %s=?",
+			self._table_class()._sql_identifier(tab),
+			self._table_class()._sql_identifier(col),
+		);
+		let sth := self.get_schema().get_dbh().prepare(sql);
+		sth.execute(value);
+		die "Column " _ column{name} _ " refers to missing " _
+			column{exists_in} if not sth.next_typed_dict();
+		return true;
+	}
+
+	method insert () {
+		from std/string import join, sprint;
+
+		die "Cannot insert row already in database"
+			if self{in_database};
+		self._apply_defaults();
+		self._validate_required_columns_for_write();
+
+		let cols := self.get_column_metadata().map( function ( c ) {
+			return c{name};
+		} ).grep( function ( col ) {
+			return self{column_data}.exists(col);
+		} );
+		die "No column values to insert into " _ self.get_table_name()
+			if cols.length = 0;
+		self._validate_database_constraints(cols);
+		self._run_hooks("before_insert");
+
+		let placeholders := cols.map( function ( col ) {
+			return "?";
+		} );
+		let sql := sprint(
+			"INSERT INTO %s (%s) VALUES (%s)",
+			self._table_class()._sql_table(),
+			join( ", ", cols.map( function ( col ) {
+				return self._table_class()._sql_identifier(col);
+			} ) ),
+			join( ", ", placeholders ),
+		);
+		let values := cols.map( function ( col ) {
+			return self{column_data}{(col)};
+		} );
+		self.get_schema().get_dbh().prepare(sql).execute( ... values );
+		self{dirty} := {};
+		self{in_database} := true;
+		self._run_hooks("after_insert");
+		return self;
+	}
+
+	method update () {
+		from std/string import join, sprint;
+
+		die "Cannot update row not in database"
+			if not self{in_database};
+		self._validate_required_columns_for_write();
+
+		let pkey_names := self._table_class()._primary_key_names();
+		die "Cannot update table without primary key: " _
+			self.get_table_name()
+			if pkey_names.length = 0;
+
+		let pkey_lookup := {};
+		for ( let pkey_name in pkey_names ) {
+			pkey_lookup{(pkey_name)} := true;
+		}
+
+		let dirty_pkeys := pkey_names.grep( function ( col ) {
+			return self{dirty}.get( col, false );
+		} );
+		die "Cannot update dirty primary key fields: " _
+			join( ", ", dirty_pkeys )
+			if dirty_pkeys.length;
+
+		let cols := self.get_column_metadata().map( function ( c ) {
+			return c{name};
+		} ).grep( function ( col ) {
+			return self{dirty}.get( col, false )
+				and not pkey_lookup.exists(col);
+		} );
+		return self if cols.length = 0;
+		self._validate_database_constraints(cols);
+		self._run_hooks("before_update");
+
+		let assignments := cols.map( function ( col ) {
+			return self._table_class()._sql_identifier(col) _ "=?";
+		} );
+		let where := pkey_names.map( function ( col ) {
+			return self._table_class()._sql_identifier(col) _ "=?";
+		} );
+		let sql := sprint(
+			"UPDATE %s SET %s WHERE %s",
+			self._table_class()._sql_table(),
+			join( ", ", assignments ),
+			join( " AND ", where ),
+		);
+
+		let values := cols.map( function ( col ) {
+			return self{column_data}{(col)};
+		} );
+		for ( let pkey_name in pkey_names ) {
+			die "Missing primary key value for " _ pkey_name
+				if not self{column_data}.exists(pkey_name);
+			values.push( self{column_data}{(pkey_name)} );
+		}
+
+		self.get_schema().get_dbh().prepare(sql).execute( ... values );
+		self{dirty} := {};
+		self._run_hooks("after_update");
+		return self;
+	}
+
+	method delete () {
+		from std/string import join, sprint;
+
+		die "Cannot delete row not in database"
+			if not self{in_database};
+
+		let pkey_names := self._table_class()._primary_key_names();
+		die "Cannot delete from table without primary key: " _
+			self.get_table_name() if pkey_names.length = 0;
+		self._run_hooks("before_delete");
+
+		let where := pkey_names.map( function ( col ) {
+			return self._table_class()._sql_identifier(col) _ "=?";
+		} );
+		let sql := sprint(
+			"DELETE FROM %s WHERE %s",
+			self._table_class()._sql_table(),
+			join( " AND ", where ),
+		);
+		let values := [];
+		for ( let pkey_name in pkey_names ) {
+			die "Missing primary key value for " _ pkey_name
+				if not self{column_data}.exists(pkey_name);
+			values.push( self{column_data}{(pkey_name)} );
+		}
+
+		self.get_schema().get_dbh().prepare(sql).execute( ... values );
+		self{dirty} := {};
+		self{in_database} := false;
+		self._run_hooks("after_delete");
+		return self;
+	}
+
+	method _rq_find ( pkey ) {
+		const pkey_names := self._table_class()._primary_key_names();
+		let pkey_values := [];
+		if ( pkey instanceof Array ) {
+			let i := 0;
+			while ( i < pkey_names.length() ) {
+				pkey_values.push(
+					self._deflate_column( pkey_names[i], pkey[i] )
+				);
+				++i;
+			}
+		}
+		else if ( pkey instanceof Dict or pkey instanceof PairList ) {
+			for ( let pkey_name in pkey_names ) {
+				pkey_values.push(
+					self._deflate_column(
+						pkey_name,
+						pkey{(pkey_name)}
+					)
+				);
+			}
+		}
+		else if ( pkey_names.length = 1 ) {
+			pkey_values := [
+				self._deflate_column( pkey_names[0], pkey )
+			];
+		}
+		else {
+			die "Expected Array or Dict of primary key values";
+		}
+
+		from std/string import sprint, join;
+		let sql := sprint(
+			"SELECT * FROM %s WHERE %s",
+			self._table_class()._sql_table(),
+			join( " AND ", pkey_names.map( function ( col ) {
+				return self._table_class()._sql_identifier(col) _ "=?";
+			} ) ),
+		);
+		let sth := self.get_schema().get_dbh().prepare(sql);
+		sth.execute( ... pkey_values );
+		let row := sth.next_typed_dict();
+		if ( row ) {
+			return self._table_class()._from_database(row);
+		}
+		return null;
+	}
+
+	method _rq_search_column ( String col ) {
+		return self._column(col);
+	}
+
+	method _rq_search_deflate ( String col, value ) {
+		return self._deflate_column( col, value );
+	}
+
+	method _rq_search_operator ( String raw_op ) {
+		let op := uc raw_op;
+		return op if op eq "=";
+		return op if op eq "!=";
+		return op if op eq "<>";
+		return op if op eq "<";
+		return op if op eq "<=";
+		return op if op eq ">";
+		return op if op eq ">=";
+		return op if op eq "LIKE";
+		return op if op eq "NOT LIKE";
+		return op if op eq "ILIKE";
+		return op if op eq "IN";
+		return op if op eq "NOT IN";
+		return op if op eq "BETWEEN";
+		die "Unsupported search operator: " _ raw_op;
+	}
+
+	method _rq_search_compare ( String col, condition, Array binds ) {
+		let column := self._rq_search_column(col);
+		let sql_col := self._table_class()._sql_identifier(column{name});
+		let op := "=";
+		let value := condition;
+
+		if ( condition instanceof Array ) {
+			die "Search condition array for " _ col _
+				" needs [ operator, value ]"
+				if condition.length() ≢ 2;
+			op := self._rq_search_operator(condition[0]);
+			value := condition[1];
+		}
+
+		if ( op eq "IN" or op eq "NOT IN" ) {
+			die "Search " _ op _ " condition for " _ col _
+				" expects an Array"
+				if not ( value instanceof Array );
+			return op eq "IN" ? "0=1" : "1=1"
+				if value.length() = 0;
+			from std/string import join;
+			for ( let item in value ) {
+				binds.push( self._rq_search_deflate( col, item ) );
+			}
+			return sql_col _ " " _ op _ " (" _
+				join( ", ", value.map( → "?" ) ) _ ")";
+		}
+
+		if ( op eq "BETWEEN" ) {
+			die "Search BETWEEN condition for " _ col _
+				" expects [ low, high ]"
+				if not ( value instanceof Array )
+				or value.length() ≢ 2;
+			binds.push( self._rq_search_deflate( col, value[0] ) );
+			binds.push( self._rq_search_deflate( col, value[1] ) );
+			return sql_col _ " BETWEEN ? AND ?";
+		}
+
+		if ( value ≡ null ) {
+			return sql_col _ " IS NULL" if op eq "=";
+			return sql_col _ " IS NOT NULL" if op eq "!=" or op eq "<>";
+		}
+
+		binds.push( self._rq_search_deflate( col, value ) );
+		if ( op eq "ILIKE" ) {
+			return "LOWER(" _ sql_col _ ") LIKE LOWER(?)";
+		}
+		return sql_col _ " " _ op _ " ?";
+	}
+
+	method _rq_search_compile ( conditions, Array binds ) {
+		return "1=1" if conditions ≡ null;
+		if ( conditions instanceof Array ) {
+			return self._rq_search_compile_array( conditions, binds, "AND" );
+		}
+		if ( conditions instanceof Dict or conditions instanceof PairList ) {
+			return self._rq_search_compile_pairs( conditions, binds );
+		}
+		die "Search conditions must be Dict, PairList, or Array";
+	}
+
+	method _rq_search_compile_array (
+		Array conditions,
+		Array binds,
+		String op
+	) {
+		return "1=1" if conditions.length() = 0;
+		from std/string import join;
+		let parts := conditions.map( function ( item ) {
+			return self._rq_search_compile( item, binds );
+		} );
+		return "(" _ join( " " _ op _ " ", parts ) _ ")";
+	}
+
+	method _rq_search_compile_pairs ( conditions, Array binds ) {
+		let parts := [];
+		for ( let pair in conditions.to_Array() ) {
+			let key := pair.key;
+			let value := pair.value;
+			if ( key eq "AND" or key eq "OR" ) {
+				let group := value instanceof Array ? value : [ value ];
+				parts.push(
+					self._rq_search_compile_array( group, binds, key )
+				);
+			}
+			else if ( key eq "NOT" ) {
+				parts.push(
+					"NOT (" _ self._rq_search_compile( value, binds ) _ ")"
+				);
+			}
+			else if ( key eq "opts" ) {
+				next;
+			}
+			else {
+				parts.push( self._rq_search_compare( key, value, binds ) );
+			}
+		}
+		return "1=1" if parts.length() = 0;
+		from std/string import join;
+		return join( " AND ", parts );
+	}
+
+	method _rq_search_opts ( PairList conditions ) {
+		let opts := conditions.get( "opts", {} );
+		let clean := conditions.copy;
+		clean.remove("opts");
+		return { conditions: clean, opts: opts };
+	}
+
+	method _rq_search_order_sql ( opts ) {
+		return "" if not opts.exists("order_by");
+		let items := opts{order_by} instanceof Array
+			? opts{order_by}
+			: [ opts{order_by} ];
+		let parts := [];
+		for ( let item in items ) {
+			if ( item instanceof Array ) {
+				let direction := uc( item.length() > 1 ? item[1] : "ASC" );
+				die "Unsupported order direction: " _ direction
+					if direction ne "ASC" and direction ne "DESC";
+				parts.push(
+					self._table_class()._sql_column(item[0]) _ " " _ direction
+				);
+			}
+			else {
+				parts.push( self._table_class()._sql_column(item) _ " ASC" );
+			}
+		}
+		from std/string import join;
+		return parts.length() ? " ORDER BY " _ join( ", ", parts ) : "";
+	}
+
+	method _rq_search_limit_sql ( opts, Array binds ) {
+		let sql := "";
+		if ( opts.exists("limit") ) {
+			sql _= " LIMIT ?";
+			binds.push(opts{limit});
+		}
+		if ( opts.exists("offset") ) {
+			sql _= opts.exists("limit") ? " OFFSET ?" : " LIMIT -1 OFFSET ?";
+			binds.push(opts{offset});
+		}
+		return sql;
+	}
+
+	method _rq_search_run ( conditions, opts ) {
+		from std/string import sprint;
+
+		let binds := [];
+		let where := self._rq_search_compile( conditions, binds );
+		let sql := sprint(
+			"SELECT * FROM %s WHERE %s",
+			self._table_class()._sql_table(),
+			where,
+		) _ self._rq_search_order_sql(opts)
+			_ self._rq_search_limit_sql( opts, binds );
+		let sth := self.get_schema().get_dbh().prepare(sql);
+		sth.execute( ... binds );
+
+		let rows := [];
+		for ( let row in sth.all_typed_dict() ) {
+			rows.push( self._table_class()._from_database(row) );
+		}
+		return rows;
+	}
+
+	method _rq_search ( PairList conditions ) {
+		let parts := self._rq_search_opts(conditions);
+		return self._rq_search_run( parts{conditions}, parts{opts} );
+	}
+
+	method _rq_all ( PairList args ) {
+		return self._rq_search_run( {}, args.get( "opts", {} ) );
+	}
+
+	method _rq_first ( PairList conditions ) {
+		let parts := self._rq_search_opts(conditions);
+		let opts := parts{opts}.copy;
+		opts{limit} := 1;
+		let rows := self._rq_search_run( parts{conditions}, opts );
+		return rows.length() ? rows[0] : null;
+	}
+
+	method _rq_count ( PairList conditions ) {
+		let parts := self._rq_search_opts(conditions);
+		return self._rq_count_run(parts{conditions});
+	}
+
+	method _rq_exists ( PairList conditions ) {
+		return self._rq_count(conditions) > 0;
+	}
+
+	method _rq_count_run ( conditions ) {
+		from std/string import sprint;
+		let binds := [];
+		let where := self._rq_search_compile( conditions, binds );
+		let sql := sprint(
+			"SELECT COUNT(*) AS rowquill_count FROM %s WHERE %s",
+			self._table_class()._sql_table(),
+			where,
+		);
+		let sth := self.get_schema().get_dbh().prepare(sql);
+		sth.execute( ... binds );
+		return sth.next_typed_dict(){rowquill_count};
+	}
+
+	method _rq_find_or_create ( PairList opts ) {
+		let rows := self._rq_search_run( opts{find}, { limit: 1 } );
+		return rows[0] if rows.length();
+		let data := {};
+		for ( let pair in opts{find}.to_Array() ) {
+			next if pair.key eq "AND" or pair.key eq "OR" or pair.key eq "NOT";
+			next if pair.value instanceof Array;
+			data{(pair.key)} := pair.value;
+		}
+		for ( let pair in opts.get( "create", {} ).to_Array() ) {
+			data{(pair.key)} := pair.value;
+		}
+		let row := self._table_class()._create_from(data);
+		row.insert();
+		return row;
+	}
+
+	method _rq_create_or_update ( PairList opts ) {
+		let rows := self._rq_search_run( opts{find}, { limit: 1 } );
+		let row := rows.length()
+			? rows[0]
+			: self._table_class()._create_from(opts{find});
+		for ( let pair in opts.get( "set", {} ).to_Array() ) {
+			row._set_column( pair.key, pair.value );
+		}
+		row.insert_or_update();
+		return row;
+	}
+
+	method is_dirty () {
+		return self{dirty}.to_Array().length() > 0;
+	}
+
+	method dirty_fields () {
+		return self{dirty}.to_Array().grep(
+			fn pair → pair.value
+		).map(
+			fn pair → pair.key
+		);
+	}
+
+	method mark_clean () {
+		self{dirty} := {};
+		return self;
+	}
+
+	method reload () {
+		die "Cannot reload row not in database"
+			if not self{in_database};
+		let fresh := self._table_class().find( self._primary_key_value() );
+		die "Row no longer exists in database" if fresh ≡ null;
+		self{column_data} := fresh{column_data}.copy;
+		self{dirty} := {};
+		self{in_database} := true;
+		return self;
+	}
+
+	method _primary_key_value () {
+		let pkeys := self._table_class()._primary_key_names();
+		die "Cannot use row without primary key"
+			if pkeys.length = 0;
+		if ( pkeys.length = 1 ) {
+			die "Missing primary key value for " _ pkeys[0]
+				if not self{column_data}.exists(pkeys[0]);
+			return self._get_column(pkeys[0]);
+		}
+		let values := [];
+		for ( let pkey in pkeys ) {
+			die "Missing primary key value for " _ pkey
+				if not self{column_data}.exists(pkey);
+			values.push( self._get_column(pkey) );
+		}
+		return values;
+	}
+
+	method insert_or_update () {
+		try { self.insert() } catch (e) { self.update() };
+	}
+}
+
+class ClassMaker {
+	let table;
+	let schema;
+	let _cols := [];
+	let _pkey := [];
+	let _rels := [];
+	let _helpers := [];
+	let _hooks := {
+		before_insert: [],
+		after_insert:  [],
+		before_update: [],
+		after_update:  [],
+		before_delete: [],
+		after_delete:  [],
+	};
+
+	method add_column ( String colname, String type, ... PairList pl ) {
+		const opts := pl ? pl.copy : {{}};
+		opts{name} := colname;
+		opts{type} := type;
+		_cols.push( opts );
+		_pkey.push( opts ) if opts{primary};
+	}
+
+	method add_helper ( String methodname, Function cb, ... PairList pl ) {
+		const opts := pl ? pl.copy : {{}};
+		opts{name} := methodname;
+		opts{callback} := cb;
+		_helpers.push( opts );
+	}
+
+	method add_static ( String methodname, Function cb, ... PairList pl ) {
+		const opts := pl ? pl.copy : {{}};
+		opts{name} := methodname;
+		opts{callback} := cb;
+		opts{is_static} := true;
+		_helpers.push( opts );
+	}
+
+	method before_insert ( Function cb ) { _hooks{before_insert}.push(cb); }
+	method after_insert  ( Function cb ) { _hooks{after_insert}.push(cb);  }
+	method before_update ( Function cb ) { _hooks{before_update}.push(cb); }
+	method after_update  ( Function cb ) { _hooks{after_update}.push(cb);  }
+	method before_delete ( Function cb ) { _hooks{before_delete}.push(cb); }
+	method after_delete  ( Function cb ) { _hooks{after_delete}.push(cb);  }
+
+	method has_one ( ... PairList pl ) {
+		const opts := pl.copy;
+		self._validate_relationship_opts(opts);
+		opts{type} := "has_one";
+		_rels.push(opts);
+	}
+
+	method has_many ( ... PairList pl ) {
+		const opts := pl.copy;
+		self._validate_relationship_opts(opts);
+		opts{type} := "has_many";
+		_rels.push(opts);
+	}
+
+	method _validate_relationship_opts ( opts ) {
+		let join := opts{join};
+		die "Relationship join must be a Dict or PairList"
+			if not ( join instanceof Dict or join instanceof PairList );
+		die "Relationship where must be a Dict or PairList"
+			if opts.exists("where")
+			and not (
+				opts{where} instanceof Dict
+				or opts{where} instanceof PairList
+			);
+		return true;
+	}
+
+	method _make_accessors () {
+		from std/string import join;
+		return join( "\n", self{_cols}.map( function (c) {
+			const colname := c{name};
+			const accessorname := c{accessor} ?: c{name};
+			let code := ```
+				method ${accessorname} ( ... PairList opts ) {
+					if ( opts.exists("set") ) {
+						self._set_column(
+							"${colname}",
+							opts{set},
+							opts.get( "raw", false )
+						);
+					}
+					return self._get_column(
+						"${colname}",
+						opts.get( "raw", false )
+					);
+				}
+			```;
+			if ( accessorname ne colname ) {
+				code _= ```
+					method ${colname} ( ... PairList opts ) {
+						return self.${accessorname}( ... opts );
+					}
+				```;
+			}
+			return code;
+		} ) );
+	}
+
+	method _make_relationship_accessors () {
+		from std/string import join;
+		let i := -1;
+		return join( "\n", self{_rels}.map( function (r) {
+			i++;
+			const accessorname := r{accessor};
+			if ( r{type} eq "has_one" ) {
+				return ```
+				method ${accessorname} ( ... PairList opts ) {
+					return self._set_relationship(
+						self.get_relationship_metadata()[${i}],
+						opts{set}
+					) if opts.exists("set");
+					return self._has_one(
+						self.get_relationship_metadata()[${i}]
+					);
+				}
+				```;
+			}
+			return ```
+			method ${accessorname} ( ... PairList opts ) {
+				return self._set_relationship(
+					self.get_relationship_metadata()[${i}],
+					opts{set}
+				) if opts.exists("set");
+				return self._has_many(
+					self.get_relationship_metadata()[${i}]
+				);
+			}
+			```;
+		} ) );
+	}
+
+	method _make_helpers () {
+		from std/string import join;
+		let i := -1;
+		return join( "\n", self{_helpers}.map( function (h) {
+			i++;
+			let metadata := h{is_static}
+				? "self._helper_metadata()"
+				: "self.get_helper_metadata()";
+			return ```
+				${ h{is_static} ? "static method" : "method" } ${ h{name} } ( ... Array a, PairList p ) {
+					return ${metadata}[${i}]{callback}( self, ...a, ...p );
+				}
+			```
+		} ) );
+	}
+
+	method make_class () {
+		const CODE := do {
+			from std/string import camel;
+			let class_name := camel( self{table} );
+			class_name[0] := "TABLE_" _ uc class_name[0];
+
+			```
+			let _cached_pkeys;
+
+			class ${class_name} with TableClass {
+				let column_data := {};
+				let dirty := {};
+				let in_database := false;
+
+				method get_schema () {
+					return SCHEMA;
+				}
+
+				method get_table_name () {
+					return TABLE_NAME;
+				}
+
+				method get_column_metadata () {
+					return COLUMNS;
+				}
+
+				method get_relationship_metadata () {
+					return RELATIONSHIPS;
+				}
+
+				method get_helper_metadata () {
+					return HELPERS;
+				}
+
+				method get_hook_metadata () {
+					return HOOKS;
+				}
+
+				static method _schema () {
+					return SCHEMA;
+				}
+
+				static method _table_name () {
+					return TABLE_NAME;
+				}
+
+				static method _column_metadata () {
+					return COLUMNS;
+				}
+
+				static method _helper_metadata () {
+					return HELPERS;
+				}
+
+				static method _sql_identifier ( String name ) {
+					die "Invalid SQL identifier: " _ name
+						if not ( name ~ /^[A-Za-z_][A-Za-z0-9_]*$/ );
+					return "\"" _ name _ "\"";
+				}
+
+				static method _column_def ( String col ) {
+					for ( let c in self._column_metadata() ) {
+						return c if c{name} eq col;
+						return c if c.get( "accessor", "" ) eq col;
+					}
+					die "No such column: " _ col;
+				}
+
+				static method _sql_column ( String col ) {
+					return self._sql_identifier( self._column_def(col){name} );
+				}
+
+				static method _sql_table () {
+					return self._sql_identifier( self._table_name() );
+				}
+
+				static method _primary_key_names () {
+					_cached_pkeys ?:= self._column_metadata().grep(
+						→ ^^.get( "primary", false )
+					);
+					return _cached_pkeys.map( → ^^{name} );
+				}
+
+				static method create ( ... PairList opts ) {
+					return self._create_from(opts);
+				}
+
+				static method _create_from ( data ) {
+					let i := new self();
+					for ( data.to_Array() ) {
+						i._set_column( ^^.key, ^^.value );
+					}
+					i._apply_defaults();
+					return i;
+				}
+
+				static method _from_database ( Dict row ) {
+					let i := new self();
+					for ( let pair in row.to_Array() ) {
+						i{column_data}{(pair.key)} := pair.value;
+					}
+					i{dirty} := {};
+					i{in_database} := true;
+					return i;
+				}
+
+				static method find ( pkey ) {
+					return ( new self() )._rq_find(pkey);
+				}
+
+				static method _search_run ( conditions, opts ) {
+					return ( new self() )._rq_search_run( conditions, opts );
+				}
+
+				static method search ( ... PairList conditions ) {
+					return ( new self() )._rq_search(conditions);
+				}
+
+				static method all ( ... PairList args ) {
+					return ( new self() )._rq_all(args);
+				}
+
+				static method first ( ... PairList conditions ) {
+					return ( new self() )._rq_first(conditions);
+				}
+
+				static method count ( ... PairList conditions ) {
+					return ( new self() )._rq_count(conditions);
+				}
+
+				static method exists ( ... PairList conditions ) {
+					return ( new self() )._rq_exists(conditions);
+				}
+
+				static method _count_run ( conditions ) {
+					return ( new self() )._rq_count_run(conditions);
+				}
+
+				static method find_or_create ( ... PairList opts ) {
+					return ( new self() )._rq_find_or_create(opts);
+				}
+
+				static method create_or_update ( ... PairList opts ) {
+					return ( new self() )._rq_create_or_update(opts);
+				}
+
+				${self._make_accessors()}
+				${self._make_relationship_accessors()}
+				${self._make_helpers()}
+			}
+			${class_name};
+			```
+		};
+
+		from std/eval import eval;
+		const SCHEMA     := self{schema};
+		const TABLE_NAME := self{table};
+		const COLUMNS    := self{_cols};
+		const RELATIONSHIPS := self{_rels};
+		const HELPERS    := self{_helpers};
+		const HOOKS      := self{_hooks};
+		return eval( CODE );
+	}
+}
+

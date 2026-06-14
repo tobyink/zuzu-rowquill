@@ -31,6 +31,24 @@ callbacks, validation, and simple C<has_one> and C<has_many>
 relationships. Table builders can also add custom row helper methods
 and static table-class helper methods.
 
+=head2 Searching
+
+C<search> accepts named column conditions. Operator conditions are arrays
+containing the SQL-ish operator and value. Supported operators include
+C<LIKE>, C<NOT LIKE>, C<ILIKE>, C<IN>, C<NOT IN>, and C<BETWEEN>.
+
+  let Employee := schema.table("employee");
+  Employee.search(
+      name: [ "ILIKE", "%rob%" ],
+      id:   [ "IN", [ 1, 2, 3 ] ],
+      opts: { order_by: [ [ "name", "ASC" ] ], limit: 20 },
+  );
+
+Condition groups may be nested with C<AND>, C<OR>, and C<NOT>. Query
+options live under C<opts>. Convenience methods C<all>, C<first>,
+C<count>, C<exists>, C<find_or_create>, and C<create_or_update> are also
+available.
+
 Relationship joins are declared as mappings from columns on the current
 row to columns on the related table. Multiple mappings are combined
 with AND. Relationships may also include a C<where> condition using the
@@ -40,8 +58,13 @@ same condition style as C<search>.
       accessor: "employees",
       table:    "employee",
       join:     { id: "dept", company: "company" },
-      where:    { is_deleted: false },
-  );
+	      where:    { is_deleted: false },
+	  );
+
+A non-narrowed C<has_one> relationship may be assigned with
+C<relationship(set: row)>; this copies every join column from the related
+row. C<has_many> relationships and relationships with C<where> filters
+cannot be assigned this way.
 
 =head2 Helper Methods
 
@@ -51,14 +74,38 @@ arguments passed to the generated method.
 
   tab.add_helper( "is_accountant", function ( employee ) {
       return employee.department().name() eq "Accounts";
-  } );
+	  } );
 
 C<add_static> adds a static method to the generated table class. The
 callback receives the table class as its first argument.
 
   tab.add_static( "named", function ( Employee, String name ) {
       return Employee.search( name: name );
-  } );
+	  } );
+
+=head2 Column Options
+
+Column options include C<primary>, C<accessor>, C<inflate>, C<deflate>,
+C<length>, C<pattern>, C<validate>, C<required>, C<default>,
+C<readonly>, C<unique>, and C<exists_in>. Multiple C<length>,
+C<pattern>, and C<validate> options are honoured.
+
+C<default> may be a value or callback. C<readonly> prevents a column from
+being changed after insertion. C<unique> checks for an existing non-null
+value before writes. C<exists_in> checks a non-null value against another
+table and column using a C<table.column> string.
+
+=head2 Hooks
+
+Table builders can register lifecycle hooks. Each callback receives the row
+object. Supported hooks are C<before_insert>, C<after_insert>,
+C<before_update>, C<after_update>, C<before_delete>, and C<after_delete>.
+
+=head2 Transactions
+
+C<Schema.transaction> runs a callback inside a transaction and returns the
+callback result. Exceptions roll the transaction back and are rethrown.
+Nested transactions use savepoints.
 
 =head1 EXPORTS
 
@@ -81,613 +128,15 @@ License version 2.
 
 =cut
 
-class ClassMaker {
-	let table;
-	let schema;
-	let _cols := [];
-	let _pkey := [];
-	let _rels := [];
-	let _helpers := [];
+from db/rowquill/tableclass import ClassMaker as _RowquillClassMaker;
 
-	method add_column ( String colname, String type, ... PairList pl ) {
-		const opts := pl ? pl.copy : {{}};
-		opts{name} := colname;
-		opts{type} := type;
-		_cols.push( opts );
-		_pkey.push( opts ) if opts{primary};
-	}
-
-	method add_helper ( String methodname, Function cb, ... PairList pl ) {
-		const opts := pl ? pl.copy : {{}};
-		opts{name} := methodname;
-		opts{callback} := cb;
-		_helpers.push( opts );
-	}
-
-	method add_static ( String methodname, Function cb, ... PairList pl ) {
-		const opts := pl ? pl.copy : {{}};
-		opts{name} := methodname;
-		opts{callback} := cb;
-		opts{is_static} := true;
-		_helpers.push( opts );
-	}
-
-	method has_one ( ... PairList pl ) {
-		const opts := pl.copy;
-		self._validate_relationship_opts(opts);
-		opts{type} := "has_one";
-		_rels.push(opts);
-	}
-
-	method has_many ( ... PairList pl ) {
-		const opts := pl.copy;
-		self._validate_relationship_opts(opts);
-		opts{type} := "has_many";
-		_rels.push(opts);
-	}
-
-	method _validate_relationship_opts ( opts ) {
-		let join := opts{join};
-		die "Relationship join must be a Dict or PairList"
-			if not ( join instanceof Dict or join instanceof PairList );
-		die "Relationship where must be a Dict or PairList"
-			if opts.exists("where")
-			and not (
-				opts{where} instanceof Dict
-				or opts{where} instanceof PairList
-			);
-		return true;
-	}
-
-	method _make_accessors () {
-		from std/string import join;
-		return join( "\n", self{_cols}.map( function (c) {
-			const colname := c{name};
-			const accessorname := c{accessor} ?: c{name};
-			let code := ```
-				method ${accessorname} ( ... PairList opts ) {
-					if ( opts.exists("set") ) {
-						self._set_column(
-							"${colname}",
-							opts{set},
-							opts.get( "raw", false )
-						);
-					}
-					return self._get_column(
-						"${colname}",
-						opts.get( "raw", false )
-					);
-				}
-			```;
-			if ( accessorname ne colname ) {
-				code _= ```
-					method ${colname} ( ... PairList opts ) {
-						return self.${accessorname}( ... opts );
-					}
-				```;
-			}
-			return code;
-		} ) );
-	}
-
-	method _make_relationship_accessors () {
-		from std/string import join;
-		let i := -1;
-		return join( "\n", self{_rels}.map( function (r) {
-			i++;
-			const accessorname := r{accessor};
-			if ( r{type} eq "has_one" ) {
-				return ```
-					method ${accessorname} () {
-						return self._has_one( RELATIONSHIPS[${i}] );
-					}
-				```;
-			}
-			return ```
-				method ${accessorname} () {
-					return self._has_many( RELATIONSHIPS[${i}] );
-				}
-			```;
-		} ) );
-	}
-
-	method _make_helpers () {
-		from std/string import join;
-		let i := -1;
-		return join( "\n", self{_helpers}.map( function (h) {
-			i++;
-			return ```
-				${ h{is_static} ? "static method" : "method" } ${ h{name} } ( ... Array a, PairList p ) {
-					return HELPERS[${i}]{callback}( self, ...a, ...p );
-				}
-			```
-		} ) );
-	}
-
-	method make_class () {
-		const CODE := do {
-			from std/string import camel;
-			let class_name := camel( self{table} );
-			class_name[0] := "TABLE_" _ uc class_name[0];
-
-			```
-			let _cached_pkeys;
-
-			class ${class_name} {
-				let column_data := {};
-				let dirty := {};
-				let in_database := false;
-
-				method _column ( String col ) {
-					for ( let c in COLUMNS ) {
-						return c if c{name} eq col;
-						return c if c.get( "accessor", "" ) eq col;
-					}
-					die "No such column: " _ col;
-				}
-
-				method _inflate_column ( String col, value ) {
-					let c := self._column(col);
-					return c{inflate}(value) if c.exists("inflate");
-					return value;
-				}
-
-				method _deflate_column ( String col, value ) {
-					let c := self._column(col);
-					return c{deflate}(value) if c.exists("deflate");
-					return value;
-				}
-
-				method _validate_column ( String col, value, raw_value ) {
-					let c := self._column(col);
-					if ( c.get( "required", false ) and raw_value ≡ null ) {
-						die "Column " _ col _ " is required";
-					}
-
-					for ( let max_length in c.get_all("length") ) {
-						if ( length raw_value > max_length ) {
-							die "Column " _ col _
-								" exceeds maximum length " _ max_length;
-						}
-					}
-
-					for ( let pattern in c.get_all("pattern") ) {
-						if ( not ( raw_value ~ pattern ) ) {
-							die "Column " _ col _ " does not match pattern";
-						}
-					}
-
-					for ( let validator in c.get_all("validate") ) {
-						if ( not validator(value) ) {
-							die "Column " _ col _ " failed validation";
-						}
-					}
-
-					return true;
-				}
-
-				method _validate_required_columns_for_write () {
-					for ( let c in COLUMNS ) {
-						let col := c{name};
-						if ( c.get( "required", false ) ) {
-							if (
-								not self{column_data}.exists(col)
-								or self{column_data}{(col)} ≡ null
-							) {
-								die "Column " _ col _ " is required";
-							}
-						}
-					}
-					return true;
-				}
-
-				method _set_column ( String col, value, Boolean raw := false ) {
-					let raw_value := raw
-						? value
-						: self._deflate_column( col, value );
-					let validators := self._column(col).get_all("validate");
-					let value_for_validation := raw and validators.length()
-						? self._inflate_column( col, raw_value )
-						: value;
-					self._validate_column(
-						col,
-						value_for_validation,
-						raw_value
-					);
-					self{column_data}{(col)} := raw_value;
-					self{dirty}{(col)} := true;
-					return self;
-				}
-
-				method _get_column ( String col, Boolean raw := false ) {
-					let value := self{column_data}{(col)};
-					return raw ? value : self._inflate_column( col, value );
-				}
-
-				method _relationship_conditions ( rel ) {
-					let conditions := {};
-					for ( let pair in rel{join}.to_Array() ) {
-						let local_col := self._column(pair.key){name};
-						let value := self._get_column(local_col);
-						return null if value ≡ null;
-						conditions{(pair.value)} := value;
-					}
-					if ( rel.exists("where") ) {
-						return { AND: [ conditions, rel{where} ] };
-					}
-					return conditions;
-				}
-
-				method _has_one ( rel ) {
-					let conditions := self._relationship_conditions(rel);
-					return null if conditions ≡ null;
-					let rows := SCHEMA.table(rel{table})._search_run(conditions);
-					return rows[0] if rows.length() > 0;
-					return null;
-				}
-
-				method _has_many ( rel ) {
-					let conditions := self._relationship_conditions(rel);
-					return [] if conditions ≡ null;
-					return SCHEMA.table(rel{table})._search_run(conditions);
-				}
-
-				static method create ( ... PairList opts ) {
-					let i := new self();
-					for ( opts.to_Array ) {
-						i._set_column( ^^.key, ^^.value );
-					}
-					return i;
-				}
-
-				static method _from_database ( Dict row ) {
-					let i := new self();
-					for ( let pair in row.to_Array() ) {
-						i{column_data}{(pair.key)} := pair.value;
-					}
-					i{dirty} := {};
-					i{in_database} := true;
-					return i;
-				}
-
-				static method find ( pkey ) {
-					_cached_pkeys ?:= COLUMNS.grep( → ^^.get( "primary", false ) );
-					const pkey_names := _cached_pkeys.map( → ^^{name} );
-					let pkey_values := [];
-					let converter := new self();
-					if ( pkey instanceof Array ) {
-						let i := 0;
-						while ( i < pkey_names.length() ) {
-							pkey_values.push(
-								converter._deflate_column( pkey_names[i], pkey[i] )
-							);
-							++i;
-						}
-					}
-					else if ( pkey instanceof Dict or pkey instanceof PairList ) {
-						for ( let pkey_name in pkey_names ) {
-							pkey_values.push(
-								converter._deflate_column(
-									pkey_name,
-									pkey{(pkey_name)}
-								)
-							);
-						}
-					}
-					else if ( pkey_names.length = 1 ) {
-						pkey_values := [
-							converter._deflate_column( pkey_names[0], pkey )
-						];
-					}
-					else {
-						die "Expected Array or Dict of primary key values";
-					}
-
-					from std/string import sprint, join;
-					let sql := sprint(
-						"SELECT * FROM %s WHERE %s",
-						TABLE_NAME,
-						join( " AND ", pkey_names.map( function ( col ) {
-							return col _ "=?";
-						} ) ),
-					);
-					let sth := SCHEMA.get_dbh().prepare(sql);
-					sth.execute( ... pkey_values );
-					if ( let row := sth.next_typed_dict() ) {
-						return self._from_database(row);
-					}
-					return null;
-				}
-
-				static method _search_column ( String col ) {
-					for ( let c in COLUMNS ) {
-						return c if c{name} eq col;
-						return c if c.get( "accessor", "" ) eq col;
-					}
-					die "No such column: " _ col;
-				}
-
-				static method _search_deflate ( String col, value ) {
-					return ( new self() )._deflate_column( col, value );
-				}
-
-				static method _search_operator ( String raw_op ) {
-					let op := uc raw_op;
-					return op if op eq "=";
-					return op if op eq "!=";
-					return op if op eq "<>";
-					return op if op eq "<";
-					return op if op eq "<=";
-					return op if op eq ">";
-					return op if op eq ">=";
-					return op if op eq "LIKE";
-					return op if op eq "NOT LIKE";
-					die "Unsupported search operator: " _ raw_op;
-				}
-
-				static method _search_compare ( String col, condition, Array binds ) {
-					let column := self._search_column(col);
-					let sql_col := column{name};
-					let op := "=";
-					let value := condition;
-
-					if ( condition instanceof Array ) {
-						die "Search condition array for " _ col _
-							" needs [ operator, value ]"
-							if condition.length() ≢ 2;
-						op := self._search_operator(condition[0]);
-						value := condition[1];
-					}
-
-					if ( value ≡ null ) {
-						return sql_col _ " IS NULL" if op eq "=";
-						return sql_col _ " IS NOT NULL" if op eq "!=";
-						return sql_col _ " IS NOT NULL" if op eq "<>";
-					}
-
-					binds.push( self._search_deflate( col, value ) );
-					return sql_col _ " " _ op _ " ?";
-				}
-
-				static method _search_compile ( conditions, Array binds ) {
-					if ( conditions instanceof PairList or conditions instanceof Dict ) {
-						return self._search_compile_pairs( conditions, binds );
-					}
-					die "Search condition group must be Dict or PairList";
-				}
-
-				static method _search_compile_array (
-					Array items,
-					Array binds,
-					String joiner,
-					String empty_sql
-				) {
-					let parts := [];
-					for ( let item in items ) {
-						parts.push( "(" _ self._search_compile( item, binds ) _ ")" );
-					}
-					return empty_sql if parts.length() = 0;
-					from std/string import join;
-					return join( " " _ joiner _ " ", parts );
-				}
-
-				static method _search_compile_pairs ( conditions, Array binds ) {
-					let parts := [];
-
-					for ( let pair in conditions.to_Array() ) {
-						let key := pair.key;
-						let value := pair.value;
-
-						if ( key eq "AND" ) {
-							parts.push( "(" _ self._search_compile_array(
-								value,
-								binds,
-								"AND",
-								"1=1"
-							) _ ")" );
-						}
-						else if ( key eq "OR" ) {
-							parts.push( "(" _ self._search_compile_array(
-								value,
-								binds,
-								"OR",
-								"0=1"
-							) _ ")" );
-						}
-						else if ( key eq "NOT" ) {
-							parts.push(
-								"NOT (" _ self._search_compile( value, binds ) _ ")"
-							);
-						}
-						else {
-							parts.push( self._search_compare( key, value, binds ) );
-						}
-					}
-
-					return "1=1" if parts.length() = 0;
-					from std/string import join;
-					return join( " AND ", parts );
-				}
-
-				static method _search_run ( conditions ) {
-					from std/string import sprint;
-
-					let binds := [];
-					let where := self._search_compile( conditions, binds );
-					let sql := sprint(
-						"SELECT * FROM %s WHERE %s",
-						TABLE_NAME,
-						where,
-					);
-					let sth := SCHEMA.get_dbh().prepare(sql);
-					sth.execute( ... binds );
-
-					let rows := [];
-					for ( let row in sth.all_typed_dict() ) {
-						rows.push( self._from_database(row) );
-					}
-					return rows;
-				}
-
-				static method search ( ... PairList conditions ) {
-					return self._search_run(conditions);
-				}
-
-				method insert () {
-					from std/string import join, sprint;
-
-					die "Cannot insert row already in database"
-						if self{in_database};
-					self._validate_required_columns_for_write();
-
-					let cols := COLUMNS.map( function ( c ) {
-						return c{name};
-					} ).grep( function ( col ) {
-						return self{column_data}.exists(col);
-					} );
-					die "No column values to insert into " _ TABLE_NAME
-						if cols.length = 0;
-
-					let placeholders := cols.map( function ( col ) {
-						return "?";
-					} );
-					let sql := sprint(
-						"INSERT INTO %s (%s) VALUES (%s)",
-						TABLE_NAME,
-						join( ", ", cols ),
-						join( ", ", placeholders ),
-					);
-					let values := cols.map( function ( col ) {
-						return self{column_data}{(col)};
-					} );
-					SCHEMA.get_dbh().prepare(sql).execute( ... values );
-					self{dirty} := {};
-					self{in_database} := true;
-					return self;
-				}
-
-				method update () {
-					from std/string import join, sprint;
-
-					die "Cannot update row not in database"
-						if not self{in_database};
-					self._validate_required_columns_for_write();
-
-					let pkey_names := COLUMNS.grep( function ( c ) {
-						return c.get( "primary", false );
-					} ).map( function ( c ) {
-						return c{name};
-					} );
-					die "Cannot update table without primary key: " _ TABLE_NAME
-						if pkey_names.length = 0;
-
-					let pkey_lookup := {};
-					for ( let pkey_name in pkey_names ) {
-						pkey_lookup{(pkey_name)} := true;
-					}
-
-					let dirty_pkeys := pkey_names.grep( function ( col ) {
-						return self{dirty}.get( col, false );
-					} );
-					die "Cannot update dirty primary key fields: " _
-						join( ", ", dirty_pkeys )
-						if dirty_pkeys.length;
-
-					let cols := COLUMNS.map( function ( c ) {
-						return c{name};
-					} ).grep( function ( col ) {
-						return self{dirty}.get( col, false )
-							and not pkey_lookup.exists(col);
-					} );
-					return self if cols.length = 0;
-
-					let assignments := cols.map( function ( col ) {
-						return col _ "=?";
-					} );
-					let where := pkey_names.map( function ( col ) {
-						return col _ "=?";
-					} );
-					let sql := sprint(
-						"UPDATE %s SET %s WHERE %s",
-						TABLE_NAME,
-						join( ", ", assignments ),
-						join( " AND ", where ),
-					);
-
-					let values := cols.map( function ( col ) {
-						return self{column_data}{(col)};
-					} );
-					for ( let pkey_name in pkey_names ) {
-						die "Missing primary key value for " _ pkey_name
-							if not self{column_data}.exists(pkey_name);
-						values.push( self{column_data}{(pkey_name)} );
-					}
-
-					SCHEMA.get_dbh().prepare(sql).execute( ... values );
-					self{dirty} := {};
-					return self;
-				}
-
-				method insert_or_update () {
-					try { self.insert() } catch (e) { self.update() };
-				}
-
-				method delete () {
-					from std/string import join, sprint;
-
-					die "Cannot delete row not in database"
-						if not self{in_database};
-
-					let pkey_names := COLUMNS.grep( function ( c ) {
-						return c.get( "primary", false );
-					} ).map( function ( c ) {
-						return c{name};
-					} );
-					die "Cannot delete from table without primary key: " _
-						TABLE_NAME if pkey_names.length = 0;
-
-					let where := pkey_names.map( function ( col ) {
-						return col _ "=?";
-					} );
-					let sql := sprint(
-						"DELETE FROM %s WHERE %s",
-						TABLE_NAME,
-						join( " AND ", where ),
-					);
-					let values := [];
-					for ( let pkey_name in pkey_names ) {
-						die "Missing primary key value for " _ pkey_name
-							if not self{column_data}.exists(pkey_name);
-						values.push( self{column_data}{(pkey_name)} );
-					}
-
-					SCHEMA.get_dbh().prepare(sql).execute( ... values );
-					self{dirty} := {};
-					self{in_database} := false;
-					return self;
-				}
-
-				${self._make_accessors()}
-				${self._make_relationship_accessors()}
-				${self._make_helpers()}
-			}
-			${class_name};
-			```
-		};
-
-		from std/eval import eval;
-		const SCHEMA     := self{schema};
-		const TABLE_NAME := self{table};
-		const COLUMNS    := self{_cols};
-		const RELATIONSHIPS := self{_rels};
-		const HELPERS    := self{_helpers};
-		return eval( CODE );
-	}
-}
+class ClassMaker extends _RowquillClassMaker;
 
 class Schema {
 	let _tables := {};
 	let dbh with get, set;
+	let _transaction_depth := 0;
+	let _savepoint_seq := 0;
 
 	method add_table ( String tablename, Function cb, ... PairList opts ) {
 		const cm := new ClassMaker( table: tablename, schema: self );
@@ -700,5 +149,44 @@ class Schema {
 	method table ( String tablename ) {
 		die `No such table: ${tablename}` if not _tables.exists(tablename);
 		return self{_tables}{(tablename)};
+	}
+
+	method _exec_sql ( String sql ) {
+		self{dbh}.prepare(sql).execute();
+	}
+
+	method transaction ( Function cb ) {
+		if ( self{_transaction_depth} = 0 ) {
+			self{dbh}.begin();
+			self{_transaction_depth}++;
+			try {
+				let result := cb(self);
+				self{_transaction_depth}--;
+				self{dbh}.commit();
+				return result;
+			}
+			catch (e) {
+				self{_transaction_depth}--;
+				self{dbh}.rollback();
+				throw e;
+			}
+		}
+
+		self{_savepoint_seq}++;
+		let sp := "rowquill_sp_" _ self{_savepoint_seq};
+		self._exec_sql( "SAVEPOINT " _ sp );
+		self{_transaction_depth}++;
+		try {
+			let result := cb(self);
+			self{_transaction_depth}--;
+			self._exec_sql( "RELEASE SAVEPOINT " _ sp );
+			return result;
+		}
+		catch (e) {
+			self{_transaction_depth}--;
+			self._exec_sql( "ROLLBACK TO SAVEPOINT " _ sp );
+			self._exec_sql( "RELEASE SAVEPOINT " _ sp );
+			throw e;
+		}
 	}
 }

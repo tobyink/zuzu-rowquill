@@ -85,19 +85,57 @@ say( bob.is_accountant() );          // true
 
 ## Features
 
-- `create`, `find`, `search`, `insert`, `update`, `insert_or_update`,
-  and `delete`.
+- `create`, `find`, `search`, `all`, `first`, `count`, `exists`,
+  `find_or_create`, `create_or_update`, `insert`, `update`,
+  `insert_or_update`, and `delete`.
 - Generated column accessors with optional alternate names.
 - Primary key lookup by scalar, array, or dictionary.
-- Dirty tracking so `update` only writes changed non-primary-key fields.
+- Dirty tracking so `update` only writes changed non-primary-key fields,
+  plus `is_dirty`, `dirty_fields`, `mark_clean`, and `reload`.
 - Raw column storage in `column_data`.
 - Inflate and deflate callbacks for structured values such as JSON.
-- `length`, `pattern`, `validate`, and `required` column checks.
+- `length`, `pattern`, `validate`, `required`, `default`, `readonly`,
+  `unique`, and `exists_in` column checks.
 - `search` supports equality, common comparison operators, `LIKE`,
-  `NOT LIKE`, `AND`, `OR`, and `NOT`.
+  `NOT LIKE`, `ILIKE`, `IN`, `NOT IN`, `BETWEEN`, `AND`, `OR`, and `NOT`.
 - `has_one` and `has_many` relationships with multi-column joins and
   optional search-style `where` filters.
+- Assigning `has_one` relationships with `relationship(set: row)`.
 - Custom row helper methods and static table-class methods.
+- Lifecycle hooks for insert, update, and delete.
+- `Schema.transaction` with nested transaction savepoints.
+
+## Searching
+
+`search` takes named conditions. Operator conditions use an array containing
+the operator and value.
+
+```zzs
+schema.table("employee").search(
+	name: [ "ILIKE", "%rob%" ],
+	id:   [ "IN", [ 1, 2, 3 ] ],
+);
+```
+
+Use `AND`, `OR`, and `NOT` for nested condition groups. Query options live
+under `opts`.
+
+```zzs
+schema.table("employee").search(
+	OR: [
+		{ name: [ "LIKE", "%obert" ] },
+		{ dept: 3, date_of_birth: [ "<", "1970" ] },
+	],
+	opts: {
+		order_by: [ [ "name", "ASC" ], [ "id", "DESC" ] ],
+		limit: 20,
+		offset: 40,
+	},
+);
+```
+
+`all(opts: {...})` searches all rows. `first`, `count`, and `exists` use
+the same condition style as `search`.
 
 ## Relationships
 
@@ -125,6 +163,16 @@ with AND.
 The optional `where` condition is also applied to the related table and
 uses the same condition style as `search`, including `AND`, `OR`, `NOT`,
 and operator arrays.
+
+A non-narrowed `has_one` relationship can also set the local join columns
+from an existing related row.
+
+```zzs
+bob.department( set: accounts );
+```
+
+`has_many` relationships and relationships with `where` filters cannot be
+assigned this way.
 
 ## Helper Methods
 
@@ -173,9 +221,47 @@ Supported options include:
 - `accessor`: provides an alternate method name.
 - `inflate`: converts raw database values to application values.
 - `deflate`: converts application values to raw database values.
+- `default`: value or callback used when a row is created.
+- `readonly`: forbids changing the column after insertion.
 - `length`: limits raw string length.
 - `pattern`: requires raw values to match a regex.
 - `validate`: validates application values with a callback.
 - `required`: forbids null values in setters and writes.
+- `unique`: checks the current table for an existing non-null value before
+  insert or update.
+- `exists_in`: checks that a non-null value exists in another table, using
+  a `table.column` string.
 
 Multiple `length`, `pattern`, and `validate` options are honoured.
+
+## Hooks
+
+Table builders can register lifecycle hooks. Each callback receives the row
+object.
+
+```zzs
+tab.before_insert( function ( employee ) {
+	audit.push( "new employee " _ employee.id() );
+} );
+tab.after_update( function ( employee ) {
+	audit.push( "updated employee " _ employee.id() );
+} );
+```
+
+Supported hooks are `before_insert`, `after_insert`, `before_update`,
+`after_update`, `before_delete`, and `after_delete`.
+
+## Transactions
+
+`Schema.transaction` runs a callback inside a database transaction and
+returns the callback result. Exceptions roll the transaction back and are
+rethrown. Nested calls use savepoints.
+
+```zzs
+schema.transaction( function ( s ) {
+	s.table("employee").create(
+		id: 42,
+		name: "Bob",
+	).insert();
+} );
+```

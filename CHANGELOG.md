@@ -10,6 +10,10 @@ and this project roughly adheres to [Semantic Versioning](https://semver.org/spe
 - Add generated row helper methods and static table-class helper methods.
 - Replace string-parsed relationship joins with structured multi-column
   joins and search-style relationship where filters.
+- Add relationship assignment, richer search operators and options,
+  convenience query/create methods, row-state helpers, defaults, read-only
+  columns, unique and existence checks, lifecycle hooks, and nested
+  transactions.
 
 ## 0.0.1 - 2026-06-14
 

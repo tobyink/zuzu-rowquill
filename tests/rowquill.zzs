@@ -5,6 +5,7 @@ from test/more import *;
 
 const schema := new Schema( dbh: DB.temp() );
 const test_codec := new JSON();
+let audit := [];
 
 schema.get_dbh().prepare("""
 	CREATE TABLE department (
@@ -32,12 +33,14 @@ schema.get_dbh().prepare("""
 		id int PRIMARY KEY,
 		fullname varchar(200),
 		date_of_birth varchar(10),
-		dept int,
-		company varchar(20),
-		is_deleted bool,
-		extra_data text
-	);
-""").execute();
+			dept int,
+			company varchar(20),
+			is_deleted bool,
+			"select" varchar(20),
+			email varchar(200),
+			extra_data text
+		);
+	""").execute();
 
 schema.add_table( "employee", function ( tab ) {
 	const codec := new JSON();
@@ -60,9 +63,17 @@ schema.add_table( "employee", function ( tab ) {
 		"length": 10,
 		pattern: /^[0-9]{4}-[0-9]{2}-[0-9]{2}/,
 	);
-	tab.add_column( "dept", "int", references: "department.id" );
+	tab.add_column( "dept", "int", exists_in: "department.id" );
 	tab.add_column( "company", "varchar", "length": 20 );
 	tab.add_column( "is_deleted", "bool" );
+	tab.add_column(
+		"select",
+		"varchar",
+		accessor: "kind",
+		"default": "seed",
+		readonly: true,
+	);
+	tab.add_column( "email", "varchar", "length": 200, unique: true );
 	tab.add_column(
 		"extra_data",
 		"text",
@@ -79,6 +90,24 @@ schema.add_table( "employee", function ( tab ) {
 		table:    "department",
 		join:     { dept: "id", company: "company" },
 	);
+	tab.before_insert( function ( employee ) {
+		audit.push( "before_insert:" _ employee.id() );
+	} );
+	tab.after_insert( function ( employee ) {
+		audit.push( "after_insert:" _ employee.id() );
+	} );
+	tab.before_update( function ( employee ) {
+		audit.push( "before_update:" _ employee.id() );
+	} );
+	tab.after_update( function ( employee ) {
+		audit.push( "after_update:" _ employee.id() );
+	} );
+	tab.before_delete( function ( employee ) {
+		audit.push( "before_delete:" _ employee.id() );
+	} );
+	tab.after_delete( function ( employee ) {
+		audit.push( "after_delete:" _ employee.id() );
+	} );
 	tab.add_helper( "is_accountant", function ( employee ) {
 		return employee.department().name() eq "Accounts";
 	} );
@@ -143,7 +172,9 @@ bob.id( set: 42 );
 bob.dept( set: 3 );
 bob.company( set: "ACME" );
 bob.is_deleted( set: false );
+bob.email( set: "bob@example.com" );
 bob.extra_data( set: { "likes": "tea", "score": 7 } );
+is( bob.kind(), "seed", "defaults are applied during create" );
 
 is(
 	bob.extra_data(),
@@ -165,6 +196,41 @@ is(
 
 bob.insert();
 is( bob{dirty}, {}, "insert clears dirty fields" );
+is(
+	audit,
+	[ "before_insert:42", "after_insert:42" ],
+	"insert hooks run around database writes",
+);
+like(
+	exception( function () {
+		bob.kind( set: "changed" );
+	} ),
+	/read-only/,
+	"read-only columns cannot be changed after insert",
+);
+like(
+	exception( function () {
+		schema.table("employee").create(
+			id: 45,
+			fullname: "Duplicate Bob",
+			email: "bob@example.com",
+		).insert();
+	} ),
+	/must be unique/,
+	"unique columns reject duplicate database values",
+);
+like(
+	exception( function () {
+		schema.table("employee").create(
+			id: 46,
+			fullname: "Missing Department",
+			dept: 99,
+			email: "missing-dept@example.com",
+		).insert();
+	} ),
+	/refers to missing department.id/,
+	"exists_in columns require a referenced database row",
+);
 schema.table("employee").create(
 	id: 43,
 	fullname: "Deleted Alice",
@@ -194,6 +260,14 @@ bob2.date_of_birth( set: "1980-01-02" );
 bob2.extra_data( set: "{\"likes\":\"coffee\",\"score\":8}", raw: true );
 bob2.update();
 is( bob2{dirty}, {}, "update clears dirty fields" );
+ok(
+	audit.grep( fn event → event eq "before_update:42" ).length(),
+	"before_update hooks run",
+);
+ok(
+	audit.grep( fn event → event eq "after_update:42" ).length(),
+	"after_update hooks run",
+);
 
 let bob3 := schema.table("employee").find( [ 42 ] );
 is( bob3.name(), "Robert", "update writes changed values" );
@@ -218,6 +292,24 @@ is(
 	schema.table("employee").in_department("Accounts").map( fn employee → employee.name() ),
 	[ "Robert" ],
 	"add_static creates table class methods",
+);
+let transfer := schema.table("employee").create(
+	id: 47,
+	fullname: "Transfer",
+	email: "transfer@example.com",
+);
+transfer.department( set: schema.table("department").find( [ 3, "OTHER" ] ) );
+is(
+	[ transfer.dept(), transfer.company() ],
+	[ 3, "OTHER" ],
+	"has_one relationship setters copy every join column",
+);
+like(
+	exception( function () {
+		accounts.employees( set: bob3 );
+	} ),
+	/Cannot set has_many/,
+	"has_many relationships cannot be assigned",
 );
 
 is(
@@ -251,9 +343,161 @@ is(
 	1,
 	"search supports nested OR and AND groups",
 );
+is(
+	schema.table("employee").search( id: [ "IN", [ 42, 44 ] ] )
+		.map( fn employee → employee.id() ).sortnum(),
+	[ 42, 44 ],
+	"search supports IN",
+);
+is(
+	schema.table("employee").search( id: [ "NOT IN", [ 43 ] ] )
+		.map( fn employee → employee.id() ).sortnum(),
+	[ 42, 44 ],
+	"search supports NOT IN",
+);
+is(
+	schema.table("employee").search( id: [ "BETWEEN", [ 42, 43 ] ] )
+		.map( fn employee → employee.id() ).sortnum(),
+	[ 42, 43 ],
+	"search supports BETWEEN",
+);
+is(
+	schema.table("employee").search( name: [ "ILIKE", "%robert%" ] ).length(),
+	1,
+	"search supports portable ILIKE",
+);
+is(
+	schema.table("employee").search( kind: "seed" ).length(),
+	3,
+	"search quotes column identifiers",
+);
+is(
+	schema.table("employee").all(
+		opts: { order_by: [ [ "id", "DESC" ] ], limit: 2 },
+	).map( fn employee → employee.id() ),
+	[ 44, 43 ],
+	"all supports order_by and limit options",
+);
+is(
+	schema.table("employee").search(
+		opts: { order_by: [ [ "id", "ASC" ] ], limit: 1, offset: 1 },
+	).map( fn employee → employee.id() ),
+	[ 43 ],
+	"search supports offset options",
+);
+is( schema.table("employee").first( name: "Robert" ).id(), 42, "first returns a row" );
+is( schema.table("employee").count( kind: "seed" ), 3, "count returns matching rows" );
+is( schema.table("employee").exists( name: "Robert" ), true, "exists returns true" );
+is( schema.table("employee").exists( name: "Nobody" ), false, "exists returns false" );
+
+let found_or_created := schema.table("employee").find_or_create(
+	find: { id: 60 },
+	create: {
+		fullname: "Found Or Created",
+		email: "found-or-created@example.com",
+	},
+);
+is( found_or_created.name(), "Found Or Created", "find_or_create inserts missing rows" );
+is(
+	schema.table("employee").find_or_create(
+		find: { id: 60 },
+		create: { fullname: "Ignored" },
+	).name(),
+	"Found Or Created",
+	"find_or_create returns existing rows",
+);
+let created_or_updated := schema.table("employee").create_or_update(
+	find: { id: 61 },
+	set: {
+		fullname: "Created Or Updated",
+		email: "created-or-updated@example.com",
+	},
+);
+is( created_or_updated.name(), "Created Or Updated", "create_or_update inserts rows" );
+schema.table("employee").create_or_update(
+	find: { id: 61 },
+	set: { fullname: "Updated Again" },
+);
+is(
+	schema.table("employee").find(61).name(),
+	"Updated Again",
+	"create_or_update updates existing rows",
+);
+
+is( bob3.is_dirty(), false, "database rows start clean" );
+bob3.name( set: "Unwritten Robert" );
+is( bob3.is_dirty(), true, "is_dirty notices changed fields" );
+is( bob3.dirty_fields(), [ "fullname" ], "dirty_fields returns changed columns" );
+bob3.mark_clean();
+is( bob3.is_dirty(), false, "mark_clean clears dirty flags" );
+schema.get_dbh().prepare(
+	"UPDATE employee SET fullname=? WHERE id=?"
+).execute( "Reloaded Robert", 42 );
+bob3.reload();
+is( bob3.name(), "Reloaded Robert", "reload refreshes data from the database" );
+bob3.name( set: "Robert" );
+bob3.update();
+
+is(
+	schema.transaction( function ( s ) {
+		s.table("employee").create(
+			id: 80,
+			fullname: "Committed",
+			email: "committed@example.com",
+		).insert();
+		return "committed";
+	} ),
+	"committed",
+	"transaction returns the callback value",
+);
+is( schema.table("employee").find(80).name(), "Committed", "transaction commits" );
+like(
+	exception( function () {
+		schema.transaction( function ( s ) {
+			s.table("employee").create(
+				id: 81,
+				fullname: "Rolled Back",
+				email: "rolled-back@example.com",
+			).insert();
+			die "rollback please";
+		} );
+	} ),
+	/rollback please/,
+	"transaction rethrows callback exceptions",
+);
+is( schema.table("employee").find(81), null, "transaction rolls back on error" );
+let nested_error;
+schema.transaction( function ( s ) {
+	s.table("employee").create(
+		id: 82,
+		fullname: "Outer Commit",
+		email: "outer-commit@example.com",
+	).insert();
+	nested_error := exception( function () {
+		s.transaction( function ( inner ) {
+			inner.table("employee").create(
+				id: 83,
+				fullname: "Nested Rollback",
+				email: "nested-rollback@example.com",
+			).insert();
+			die "nested rollback";
+		} );
+	} );
+} );
+like( nested_error, /nested rollback/, "nested transaction exceptions can be caught" );
+is( schema.table("employee").find(82).name(), "Outer Commit", "outer transaction commits" );
+is( schema.table("employee").find(83), null, "nested transaction rolls back to savepoint" );
 
 bob3.delete();
 is( bob3{in_database}, false, "delete marks rows as not database backed" );
 is( schema.table("employee").find(42), null, "delete removes the row" );
+ok(
+	audit.grep( fn event → event eq "before_delete:42" ).length(),
+	"before_delete hooks run",
+);
+ok(
+	audit.grep( fn event → event eq "after_delete:42" ).length(),
+	"after_delete hooks run",
+);
 
 done_testing();
