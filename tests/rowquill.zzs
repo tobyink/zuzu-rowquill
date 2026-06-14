@@ -8,18 +8,22 @@ const test_codec := new JSON();
 
 schema.get_dbh().prepare("""
 	CREATE TABLE department (
-		id int PRIMARY KEY,
-		name varchar(200)
+		id int,
+		company varchar(20),
+		name varchar(200),
+		PRIMARY KEY (id, company)
 	);
 """).execute();
 
 schema.add_table( "department", function ( tab ) {
 	tab.add_column( "id", "int", primary: true );
+	tab.add_column( "company", "varchar", "length": 20, primary: true );
 	tab.add_column( "name", "varchar", "length": 200, required: true );
 	tab.has_many(
 		accessor: "employees",
 		table:    "employee",
-		join:     "my.id = their.dept",
+		join:     { id: "dept", company: "company" },
+		where:    { OR: [ { is_deleted: false }, { is_deleted: null } ] },
 	);
 } );
 
@@ -28,7 +32,9 @@ schema.get_dbh().prepare("""
 		id int PRIMARY KEY,
 		fullname varchar(200),
 		date_of_birth varchar(10),
-		dept int REFERENCES department(id),
+		dept int,
+		company varchar(20),
+		is_deleted bool,
 		extra_data text
 	);
 """).execute();
@@ -55,6 +61,8 @@ schema.add_table( "employee", function ( tab ) {
 		pattern: /^[0-9]{4}-[0-9]{2}-[0-9]{2}/,
 	);
 	tab.add_column( "dept", "int", references: "department.id" );
+	tab.add_column( "company", "varchar", "length": 20 );
+	tab.add_column( "is_deleted", "bool" );
 	tab.add_column(
 		"extra_data",
 		"text",
@@ -69,15 +77,32 @@ schema.add_table( "employee", function ( tab ) {
 	tab.has_one(
 		accessor: "department",
 		table:    "department",
-		join:     "my.dept = their.id",
+		join:     { dept: "id", company: "company" },
 	);
+	tab.add_helper( "is_accountant", function ( employee ) {
+		return employee.department().name() eq "Accounts";
+	} );
+	tab.add_static( "in_department", function ( Employee, String department ) {
+		let dept := schema.table("department").search( name: department )[0];
+		return Employee.search(
+			dept: dept.id(),
+			company: dept.company(),
+			is_deleted: false,
+		);
+	} );
 } );
 
 let accounts := schema.table("department").create(
 	id: 3,
+	company: "ACME",
 	name: "Accounts",
 );
 is( accounts{in_database}, false, "new rows start outside the database" );
+schema.table("department").create(
+	id: 3,
+	company: "OTHER",
+	name: "Other Accounts",
+).insert();
 accounts.insert();
 is( accounts{in_database}, true, "insert marks rows as database backed" );
 
@@ -116,6 +141,8 @@ like(
 let bob := schema.table("employee").create( fullname: "Bob" );
 bob.id( set: 42 );
 bob.dept( set: 3 );
+bob.company( set: "ACME" );
+bob.is_deleted( set: false );
 bob.extra_data( set: { "likes": "tea", "score": 7 } );
 
 is(
@@ -138,6 +165,20 @@ is(
 
 bob.insert();
 is( bob{dirty}, {}, "insert clears dirty fields" );
+schema.table("employee").create(
+	id: 43,
+	fullname: "Deleted Alice",
+	dept: 3,
+	company: "ACME",
+	is_deleted: true,
+).insert();
+schema.table("employee").create(
+	id: 44,
+	fullname: "Other Mallory",
+	dept: 3,
+	company: "OTHER",
+	is_deleted: false,
+).insert();
 
 let bob2 := schema.table("employee").find(42);
 ok( bob2, "find returns a row object" );
@@ -165,12 +206,18 @@ is(
 is(
 	bob3.department().name(),
 	"Accounts",
-	"has_one returns the related row",
+	"has_one uses every structured join column",
 );
 is(
 	accounts.employees().map( fn employee → employee.name() ),
 	[ "Robert" ],
-	"has_many returns related rows",
+	"has_many applies structured joins and where filters",
+);
+is( bob3.is_accountant(), true, "add_helper creates row instance methods" );
+is(
+	schema.table("employee").in_department("Accounts").map( fn employee → employee.name() ),
+	[ "Robert" ],
+	"add_static creates table class methods",
 );
 
 is(
@@ -185,7 +232,8 @@ is(
 );
 is(
 	schema.table("employee").search(
-		NOT: { name: "Alice" },
+		name: "Robert",
+		NOT: { is_deleted: true },
 	).length(),
 	1,
 	"search supports NOT groups",

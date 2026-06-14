@@ -28,10 +28,37 @@ wraps a C<std/db> database handle and builds one generated class per
 table. Generated row classes support C<create>, C<find>, C<search>,
 C<insert>, C<update>, C<delete>, column accessors, inflate/deflate
 callbacks, validation, and simple C<has_one> and C<has_many>
-relationships.
+relationships. Table builders can also add custom row helper methods
+and static table-class helper methods.
 
-Relationship joins currently support the form C<my.column =
-their.column>.
+Relationship joins are declared as mappings from columns on the current
+row to columns on the related table. Multiple mappings are combined
+with AND. Relationships may also include a C<where> condition using the
+same condition style as C<search>.
+
+  tab.has_many(
+      accessor: "employees",
+      table:    "employee",
+      join:     { id: "dept", company: "company" },
+      where:    { is_deleted: false },
+  );
+
+=head2 Helper Methods
+
+C<add_helper> adds an instance method to generated row objects. The
+callback receives the row object as its first argument, followed by any
+arguments passed to the generated method.
+
+  tab.add_helper( "is_accountant", function ( employee ) {
+      return employee.department().name() eq "Accounts";
+  } );
+
+C<add_static> adds a static method to the generated table class. The
+callback receives the table class as its first argument.
+
+  tab.add_static( "named", function ( Employee, String name ) {
+      return Employee.search( name: name );
+  } );
 
 =head1 EXPORTS
 
@@ -60,6 +87,7 @@ class ClassMaker {
 	let _cols := [];
 	let _pkey := [];
 	let _rels := [];
+	let _helpers := [];
 
 	method add_column ( String colname, String type, ... PairList pl ) {
 		const opts := pl ? pl.copy : {{}};
@@ -69,16 +97,46 @@ class ClassMaker {
 		_pkey.push( opts ) if opts{primary};
 	}
 
+	method add_helper ( String methodname, Function cb, ... PairList pl ) {
+		const opts := pl ? pl.copy : {{}};
+		opts{name} := methodname;
+		opts{callback} := cb;
+		_helpers.push( opts );
+	}
+
+	method add_static ( String methodname, Function cb, ... PairList pl ) {
+		const opts := pl ? pl.copy : {{}};
+		opts{name} := methodname;
+		opts{callback} := cb;
+		opts{is_static} := true;
+		_helpers.push( opts );
+	}
+
 	method has_one ( ... PairList pl ) {
 		const opts := pl.copy;
+		self._validate_relationship_opts(opts);
 		opts{type} := "has_one";
 		_rels.push(opts);
 	}
 
 	method has_many ( ... PairList pl ) {
 		const opts := pl.copy;
+		self._validate_relationship_opts(opts);
 		opts{type} := "has_many";
 		_rels.push(opts);
+	}
+
+	method _validate_relationship_opts ( opts ) {
+		let join := opts{join};
+		die "Relationship join must be a Dict or PairList"
+			if not ( join instanceof Dict or join instanceof PairList );
+		die "Relationship where must be a Dict or PairList"
+			if opts.exists("where")
+			and not (
+				opts{where} instanceof Dict
+				or opts{where} instanceof PairList
+			);
+		return true;
 	}
 
 	method _make_accessors () {
@@ -114,22 +172,35 @@ class ClassMaker {
 
 	method _make_relationship_accessors () {
 		from std/string import join;
+		let i := -1;
 		return join( "\n", self{_rels}.map( function (r) {
+			i++;
 			const accessorname := r{accessor};
-			const tablename := r{table};
-			const join := r{join};
 			if ( r{type} eq "has_one" ) {
 				return ```
 					method ${accessorname} () {
-						return self._has_one( "${tablename}", "${join}" );
+						return self._has_one( RELATIONSHIPS[${i}] );
 					}
 				```;
 			}
 			return ```
 				method ${accessorname} () {
-					return self._has_many( "${tablename}", "${join}" );
+					return self._has_many( RELATIONSHIPS[${i}] );
 				}
 			```;
+		} ) );
+	}
+
+	method _make_helpers () {
+		from std/string import join;
+		let i := -1;
+		return join( "\n", self{_helpers}.map( function (h) {
+			i++;
+			return ```
+				${ h{is_static} ? "static method" : "method" } ${ h{name} } ( ... Array a, PairList p ) {
+					return HELPERS[${i}]{callback}( self, ...a, ...p );
+				}
+			```
 		} ) );
 	}
 
@@ -233,32 +304,32 @@ class ClassMaker {
 					return raw ? value : self._inflate_column( col, value );
 				}
 
-				method _relationship_join ( String join ) {
-					let m := join ~ /^my\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*their\.([A-Za-z_][A-Za-z0-9_]*)$/;
-					die "Unsupported relationship join: " _ join if not m;
-					return { my: m[1], their: m[2] };
+				method _relationship_conditions ( rel ) {
+					let conditions := {};
+					for ( let pair in rel{join}.to_Array() ) {
+						let local_col := self._column(pair.key){name};
+						let value := self._get_column(local_col);
+						return null if value ≡ null;
+						conditions{(pair.value)} := value;
+					}
+					if ( rel.exists("where") ) {
+						return { AND: [ conditions, rel{where} ] };
+					}
+					return conditions;
 				}
 
-				method _has_one ( String table, String join ) {
-					let rel := self._relationship_join(join);
-					let value := self._get_column(rel{my});
-					return null if value ≡ null;
-
-					let conditions := {};
-					conditions{(rel{their})} := value;
-					let rows := SCHEMA.table(table)._search_run(conditions);
+				method _has_one ( rel ) {
+					let conditions := self._relationship_conditions(rel);
+					return null if conditions ≡ null;
+					let rows := SCHEMA.table(rel{table})._search_run(conditions);
 					return rows[0] if rows.length() > 0;
 					return null;
 				}
 
-				method _has_many ( String table, String join ) {
-					let rel := self._relationship_join(join);
-					let value := self._get_column(rel{my});
-					return [] if value ≡ null;
-
-					let conditions := {};
-					conditions{(rel{their})} := value;
-					return SCHEMA.table(table)._search_run(conditions);
+				method _has_many ( rel ) {
+					let conditions := self._relationship_conditions(rel);
+					return [] if conditions ≡ null;
+					return SCHEMA.table(rel{table})._search_run(conditions);
 				}
 
 				static method create ( ... PairList opts ) {
@@ -598,6 +669,7 @@ class ClassMaker {
 
 				${self._make_accessors()}
 				${self._make_relationship_accessors()}
+				${self._make_helpers()}
 			}
 			${class_name};
 			```
@@ -607,6 +679,8 @@ class ClassMaker {
 		const SCHEMA     := self{schema};
 		const TABLE_NAME := self{table};
 		const COLUMNS    := self{_cols};
+		const RELATIONSHIPS := self{_rels};
+		const HELPERS    := self{_helpers};
 		return eval( CODE );
 	}
 }
