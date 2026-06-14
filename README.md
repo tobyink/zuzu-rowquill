@@ -1,3 +1,5 @@
+<img src="https://zuzulang.org/img/rowquill/logo-small.jpeg" alt="()" class="float-end d-none d-lg-block ms-3 mb-3 rounded" />
+
 # rowquill
 
 `db/rowquill` is a small row-object ORM for ZuzuScript. It maps
