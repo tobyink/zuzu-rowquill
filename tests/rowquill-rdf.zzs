@@ -1,0 +1,242 @@
+from test/more import *;
+
+requires_capability("db");
+
+from rdf try import
+	RDFStore,
+	RDF_NS,
+	XSD_NS,
+	rdf_iri,
+	rdf_literal,
+	rdf_quad,
+	rdf_term_key;
+
+skip_all("module rdf is unavailable")
+	if RDFStore ≡ null
+	or RDF_NS ≡ null
+	or XSD_NS ≡ null
+	or rdf_iri ≡ null
+	or rdf_literal ≡ null
+	or rdf_quad ≡ null
+	or rdf_term_key ≡ null;
+
+from db/rowquill import Schema;
+from std/db import DB;
+
+function has_quad ( Array quads, subject, predicate, object ) {
+	let wanted := [
+		rdf_term_key(subject),
+		rdf_term_key(predicate),
+		rdf_term_key(object),
+	];
+	for ( let quad in quads ) {
+		let got := [
+			rdf_term_key(quad.get_subject()),
+			rdf_term_key(quad.get_predicate()),
+			rdf_term_key(quad.get_object()),
+		];
+		return true if got == wanted;
+	}
+	return false;
+}
+
+function has_predicate ( Array quads, predicate ) {
+	let wanted := rdf_term_key(predicate);
+	for ( let quad in quads ) {
+		return true if rdf_term_key(quad.get_predicate()) eq wanted;
+	}
+	return false;
+}
+
+function build_schema ( base_uri := "http://foo.example/DB/" ) {
+	let schema := new Schema( dbh: DB.temp(), base_uri: base_uri );
+
+	schema.get_dbh().prepare("""
+		CREATE TABLE department (
+			id int,
+			company varchar(20),
+			name varchar(200),
+			PRIMARY KEY (id, company)
+		);
+	""").execute();
+
+	schema.add_table( "department", function ( tab ) {
+		tab.add_column( "id", "int", primary: true );
+		tab.add_column( "company", "varchar", primary: true );
+		tab.add_column( "name", "varchar", required: true );
+	} );
+
+	schema.get_dbh().prepare("""
+		CREATE TABLE employee (
+			id int PRIMARY KEY,
+			fullname varchar(200),
+			dept int,
+			company varchar(20),
+			is_deleted bool,
+			nickname varchar(20)
+		);
+	""").execute();
+
+	schema.add_table( "employee", function ( tab ) {
+		tab.add_column( "id", "int", primary: true );
+		tab.add_column( "fullname", "varchar", accessor: "name" );
+		tab.add_column( "dept", "int" );
+		tab.add_column( "company", "varchar" );
+		tab.add_column( "is_deleted", "bool" );
+		tab.add_column( "nickname", "varchar" );
+		tab.has_one(
+			accessor: "department",
+			table:    "department",
+			join:     { dept: "id", company: "company" },
+		);
+		tab.on_rdf( function ( employee ) {
+			return [
+				rdf_quad(
+					employee._rdf_row_node(),
+					rdf_iri("http://example.com/audit"),
+					rdf_literal("custom"),
+				),
+			];
+		} );
+	} );
+
+	return schema;
+}
+
+let schema := build_schema();
+schema.table("department").create(
+	id: 3,
+	company: "ACME",
+	name: "Accounts",
+).insert();
+let bob := schema.table("employee").create(
+	id: 42,
+	name: "Bob",
+	dept: 3,
+	company: "ACME",
+	is_deleted: false,
+	nickname: null,
+);
+bob.insert();
+
+let bob_subject := rdf_iri("http://foo.example/DB/employee/id=42");
+let department_subject := rdf_iri(
+	"http://foo.example/DB/department/id=3;company=ACME"
+);
+let bob_quads := bob.as_rdf();
+
+ok( bob_quads.length() > 0, "as_rdf returns quads" );
+ok(
+	has_quad(
+		bob_quads,
+		bob_subject,
+		rdf_iri(RDF_NS _ "type"),
+		rdf_iri("http://foo.example/DB/employee"),
+	),
+	"as_rdf emits row type",
+);
+ok(
+	has_quad(
+		bob_quads,
+		bob_subject,
+		rdf_iri("http://foo.example/DB/employee#id"),
+		rdf_literal("42", "", rdf_iri(XSD_NS _ "integer")),
+	),
+	"as_rdf emits typed integer literals",
+);
+ok(
+	has_quad(
+		bob_quads,
+		bob_subject,
+		rdf_iri("http://foo.example/DB/employee#is_deleted"),
+		rdf_literal("false", "", rdf_iri(XSD_NS _ "boolean")),
+	),
+	"as_rdf emits typed boolean literals",
+);
+ok(
+	not has_predicate(
+		bob_quads,
+		rdf_iri("http://foo.example/DB/employee#nickname"),
+	),
+	"as_rdf omits null literal values",
+);
+ok(
+	has_quad(
+		bob_quads,
+		bob_subject,
+		rdf_iri("http://foo.example/DB/employee#ref-dept;company"),
+		department_subject,
+	),
+	"as_rdf emits has_one reference quads",
+);
+ok(
+	has_quad(
+		bob_quads,
+		bob_subject,
+		rdf_iri("http://example.com/audit"),
+		rdf_literal("custom"),
+	),
+	"on_rdf appends custom quads",
+);
+
+let store := RDFStore.temp();
+store.install_schema();
+is( bob.as_rdf( into: store ), store, "as_rdf into returns the store" );
+is(
+	store.find( bob_subject, rdf_iri("http://example.com/audit") ).length(),
+	1,
+	"as_rdf into stores appended quads",
+);
+
+let Employee := schema.table("employee");
+ok(
+	Employee.all_as_rdf().length() >= bob_quads.length(),
+	"table all_as_rdf returns quads for table rows",
+);
+let table_store := RDFStore.temp();
+table_store.install_schema();
+is(
+	Employee.all_as_rdf( into: table_store ),
+	table_store,
+	"table all_as_rdf into returns the store",
+);
+ok(
+	schema.all_as_rdf().length() > Employee.all_as_rdf().length(),
+	"schema all_as_rdf includes every table",
+);
+let schema_store := RDFStore.temp();
+schema_store.install_schema();
+is(
+	schema.all_as_rdf( into: schema_store ),
+	schema_store,
+	"schema all_as_rdf into returns the store",
+);
+
+let no_base_schema := build_schema(null);
+let no_base_row := no_base_schema.table("employee").create(
+	id: 1,
+	name: "No Base",
+);
+like(
+	exception( function () {
+		no_base_row.as_rdf();
+	} ),
+	/base_uri/,
+	"as_rdf requires Schema.base_uri",
+);
+
+let broken := schema.table("employee").create(
+	id: 99,
+	name: "Broken",
+	dept: 999,
+	company: "ACME",
+);
+like(
+	exception( function () {
+		broken.as_rdf();
+	} ),
+	/target row not found/,
+	"as_rdf reports broken non-null relationships",
+);
+
+done_testing();

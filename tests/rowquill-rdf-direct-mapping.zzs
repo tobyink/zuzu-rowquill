@@ -1,0 +1,183 @@
+from test/more import *;
+
+requires_capability("db");
+
+from rdf try import
+	RDF_NS,
+	XSD_NS,
+	rdf_iri,
+	rdf_literal,
+	rdf_term_key;
+
+skip_all("module rdf is unavailable")
+	if RDF_NS ≡ null
+	or XSD_NS ≡ null
+	or rdf_iri ≡ null
+	or rdf_literal ≡ null
+	or rdf_term_key ≡ null;
+
+from db/rowquill import Schema;
+from std/db import DB;
+
+function has_quad ( Array quads, subject, predicate, object ) {
+	let wanted := [
+		rdf_term_key(subject),
+		rdf_term_key(predicate),
+		rdf_term_key(object),
+	];
+	for ( let quad in quads ) {
+		let got := [
+			rdf_term_key(quad.get_subject()),
+			rdf_term_key(quad.get_predicate()),
+			rdf_term_key(quad.get_object()),
+		];
+		return true if got == wanted;
+	}
+	return false;
+}
+
+function int_literal ( value ) {
+	return rdf_literal("" _ value, "", rdf_iri(XSD_NS _ "integer"));
+}
+
+let schema := new Schema(
+	dbh: DB.temp(),
+	base_uri: "http://foo.example/DB/",
+);
+
+schema.get_dbh().prepare("""
+	CREATE TABLE "Addresses" (
+		"ID" INT,
+		"city" CHAR(10),
+		"state" CHAR(2),
+		PRIMARY KEY("ID")
+	);
+""").execute();
+
+schema.get_dbh().prepare("""
+	CREATE TABLE "People" (
+		"ID" INT,
+		"fname" CHAR(10),
+		"addr" INT,
+		PRIMARY KEY("ID"),
+		FOREIGN KEY("addr") REFERENCES "Addresses"("ID")
+	);
+""").execute();
+
+schema.add_table( "Addresses", function ( tab ) {
+	tab.add_column( "ID", "int", primary: true );
+	tab.add_column( "city", "char", "length": 10 );
+	tab.add_column( "state", "char", "length": 2 );
+} );
+
+schema.add_table( "People", function ( tab ) {
+	tab.add_column( "ID", "int", primary: true );
+	tab.add_column( "fname", "char", "length": 10 );
+	tab.add_column( "addr", "int" );
+	tab.has_one(
+		accessor: "address",
+		table:    "Addresses",
+		join:     { addr: "ID" },
+	);
+} );
+
+schema.get_dbh().prepare("""
+	INSERT INTO "Addresses" ("ID", "city", "state")
+	VALUES (18, 'Cambridge', 'MA');
+""").execute();
+
+schema.get_dbh().prepare("""
+	INSERT INTO "People" ("ID", "fname", "addr")
+	VALUES (7, 'Bob', 18);
+""").execute();
+
+schema.get_dbh().prepare("""
+	INSERT INTO "People" ("ID", "fname", "addr")
+	VALUES (8, 'Sue', NULL);
+""").execute();
+
+let graph := schema.all_as_rdf();
+
+let people_7 := rdf_iri("http://foo.example/DB/People/ID=7");
+let people_8 := rdf_iri("http://foo.example/DB/People/ID=8");
+let addresses_18 := rdf_iri("http://foo.example/DB/Addresses/ID=18");
+let people_class := rdf_iri("http://foo.example/DB/People");
+let addresses_class := rdf_iri("http://foo.example/DB/Addresses");
+
+let expected := [
+	[
+		people_7,
+		rdf_iri(RDF_NS _ "type"),
+		people_class,
+	],
+	[
+		people_7,
+		rdf_iri("http://foo.example/DB/People#ID"),
+		int_literal(7),
+	],
+	[
+		people_7,
+		rdf_iri("http://foo.example/DB/People#fname"),
+		rdf_literal("Bob"),
+	],
+	[
+		people_7,
+		rdf_iri("http://foo.example/DB/People#addr"),
+		int_literal(18),
+	],
+	[
+		people_7,
+		rdf_iri("http://foo.example/DB/People#ref-addr"),
+		addresses_18,
+	],
+	[
+		people_8,
+		rdf_iri(RDF_NS _ "type"),
+		people_class,
+	],
+	[
+		people_8,
+		rdf_iri("http://foo.example/DB/People#ID"),
+		int_literal(8),
+	],
+	[
+		people_8,
+		rdf_iri("http://foo.example/DB/People#fname"),
+		rdf_literal("Sue"),
+	],
+	[
+		addresses_18,
+		rdf_iri(RDF_NS _ "type"),
+		addresses_class,
+	],
+	[
+		addresses_18,
+		rdf_iri("http://foo.example/DB/Addresses#ID"),
+		int_literal(18),
+	],
+	[
+		addresses_18,
+		rdf_iri("http://foo.example/DB/Addresses#city"),
+		rdf_literal("Cambridge"),
+	],
+	[
+		addresses_18,
+		rdf_iri("http://foo.example/DB/Addresses#state"),
+		rdf_literal("MA"),
+	],
+];
+
+is(
+	graph.length(),
+	expected.length(),
+	"Direct Mapping section 2.1 graph has the expected size",
+);
+
+for ( let triple in expected ) {
+	ok(
+		has_quad( graph, triple[0], triple[1], triple[2] ),
+		"Direct Mapping section 2.1 graph includes expected triple",
+	);
+}
+
+done_testing();

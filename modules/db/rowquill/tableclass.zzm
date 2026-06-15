@@ -1,3 +1,69 @@
+from rdf try import
+	rdf_blank as _rq_rdf_blank_term,
+	rdf_iri as _rq_rdf_iri,
+	rdf_literal as _rq_rdf_literal,
+	rdf_quad as _rq_rdf_quad,
+	rdf_type as _rq_rdf_type,
+	xsd as _rq_xsd;
+from db/rowquill/sqlbuilder import
+	build_limit as _rq_build_limit,
+	build_order as _rq_build_order,
+	build_where as _rq_build_where;
+from std/net/url import escape as _rq_url_escape;
+from std/string import join as _rq_join;
+
+let Number _rq_blank_seq := 0;
+
+function _rq_rdf_require () {
+	die "db/rowquill RDF export requires optional module rdf"
+		if _rq_rdf_blank_term ≡ null
+		or _rq_rdf_iri ≡ null
+		or _rq_rdf_literal ≡ null
+		or _rq_rdf_quad ≡ null
+		or _rq_rdf_type ≡ null
+		or _rq_xsd ≡ null;
+	return true;
+}
+
+function _rq_rdf_base ( schema ) {
+	let base := schema.get_base_uri();
+	die "db/rowquill RDF export requires Schema.base_uri"
+		if base ≡ null or "" _ base eq "";
+	return "" _ base;
+}
+
+function _rq_rdf_column_datatype ( column ) {
+	let type := lc( "" _ column{type} );
+	return _rq_xsd("integer")
+		if type ~ /^(bigint|int|integer|smallint|tinyint)\b/;
+	return _rq_xsd("decimal")
+		if type ~ /^(decimal|numeric)\b/;
+	return _rq_xsd("double")
+		if type ~ /^(double|float|real)\b/;
+	return _rq_xsd("boolean")
+		if type ~ /^(bool|boolean)\b/;
+	return _rq_xsd("dateTime")
+		if type ~ /^(datetime|timestamp)\b/;
+	return _rq_xsd("date")
+		if type ~ /^date\b/;
+	return _rq_xsd("time")
+		if type ~ /^time\b/;
+	return _rq_xsd("string");
+}
+
+function _rq_rdf_blank () {
+	_rq_blank_seq++;
+	return _rq_rdf_blank_term( "rowquill" _ _rq_blank_seq );
+}
+
+function _rq_rdf_result ( Array quads, PairList opts ) {
+	if ( opts.exists("into") ) {
+		opts{into}.add_quads(quads);
+		return opts{into};
+	}
+	return quads;
+}
+
 trait TableClass {
 	method _table_class () {
 		return self.get_schema().table( self.get_table_name() );
@@ -78,9 +144,22 @@ trait TableClass {
 		return raw ? value : self._inflate_column( col, value );
 	}
 
+	method _relationship_join_pairs ( rel ) {
+		let pairs := rel{join}.to_Array();
+		return pairs if rel{join} instanceof PairList;
+
+		let ordered := [];
+		for ( let column in self.get_column_metadata() ) {
+			for ( let pair in pairs ) {
+				ordered.push(pair) if self._column(pair.key){name} eq column{name};
+			}
+		}
+		return ordered;
+	}
+
 	method _relationship_conditions ( rel ) {
 		let conditions := {};
-		for ( let pair in rel{join}.to_Array() ) {
+		for ( let pair in self._relationship_join_pairs(rel) ) {
 			let local_col := self._column(pair.key){name};
 			let value := self._get_column(local_col);
 			return null if value ≡ null;
@@ -97,7 +176,7 @@ trait TableClass {
 			if rel{type} eq "has_many";
 		die "Cannot set narrowed relationship " _ rel{accessor}
 			if rel.exists("where");
-		for ( let pair in rel{join}.to_Array() ) {
+		for ( let pair in self._relationship_join_pairs(rel) ) {
 			let local_col := self._column(pair.key){name};
 			let related_col := related._column(pair.value){name};
 			self._set_column(
@@ -174,6 +253,141 @@ trait TableClass {
 			hook(self);
 		}
 		return self;
+	}
+
+	method _rdf_table_iri () {
+		return _rq_rdf_iri(
+			_rq_rdf_base(self.get_schema()) _
+			_rq_url_escape(self.get_table_name())
+		);
+	}
+
+	method _rdf_column_iri ( String col ) {
+		return _rq_rdf_iri(
+			_rq_rdf_base(self.get_schema()) _
+			_rq_url_escape(self.get_table_name()) _
+			"#" _
+			_rq_url_escape(col)
+		);
+	}
+
+	method _rdf_ref_iri ( rel ) {
+		let cols := self._relationship_join_pairs(rel).map( function ( pair ) {
+			return _rq_url_escape(self._column(pair.key){name});
+		} );
+		return _rq_rdf_iri(
+			_rq_rdf_base(self.get_schema()) _
+			_rq_url_escape(self.get_table_name()) _
+			"#ref-" _
+			_rq_join( ";", cols )
+		);
+	}
+
+	method _rdf_row_node () {
+		let pkey_names := self._table_class()._primary_key_names();
+		return _rq_rdf_blank() if pkey_names.length() = 0;
+
+		let parts := [];
+		for ( let pkey_name in pkey_names ) {
+			die "Missing primary key value for " _ pkey_name
+				if not self{column_data}.exists(pkey_name)
+				or self{column_data}{(pkey_name)} ≡ null;
+			parts.push(
+				_rq_url_escape(pkey_name) _ "=" _
+				_rq_url_escape("" _ self{column_data}{(pkey_name)})
+			);
+		}
+
+		return _rq_rdf_iri(
+			_rq_rdf_base(self.get_schema()) _
+			_rq_url_escape(self.get_table_name()) _
+			"/" _
+			_rq_join( ";", parts )
+		);
+	}
+
+	method _rdf_literal_for_column ( column ) {
+		return _rq_rdf_literal(
+			"" _ self{column_data}{(column{name})},
+			"",
+			_rq_rdf_column_datatype(column),
+		);
+	}
+
+	method _rdf_reference_quads ( subject ) {
+		let quads := [];
+		for ( let rel in self.get_relationship_metadata() ) {
+			next if rel{type} ne "has_one";
+
+			let complete := true;
+			for ( let pair in self._relationship_join_pairs(rel) ) {
+				let local_col := self._column(pair.key){name};
+				if (
+					not self{column_data}.exists(local_col)
+					or self._get_column(local_col) == null
+				) {
+					complete := false;
+				}
+			}
+			next if not complete;
+
+			let related := self._has_one(rel);
+			die "Cannot map relationship " _ rel{accessor} _
+				" to RDF: target row not found"
+				if related ≡ null;
+			die "Cannot map relationship " _ rel{accessor} _
+				" to RDF: target table has no primary key"
+				if related._table_class()._primary_key_names().length() = 0;
+
+			quads.push(_rq_rdf_quad(
+				subject,
+				self._rdf_ref_iri(rel),
+				related._rdf_row_node(),
+			));
+		}
+		return quads;
+	}
+
+	method _rdf_extra_quads () {
+		let quads := [];
+		for ( let hook in self.get_rdf_hook_metadata() ) {
+			let extra := hook(self);
+			die "on_rdf callback must return an Array"
+				if not ( extra instanceof Array );
+			for ( let quad in extra ) {
+				quads.push(quad);
+			}
+		}
+		return quads;
+	}
+
+	method as_rdf ( ... PairList opts ) {
+		_rq_rdf_require();
+		_rq_rdf_base(self.get_schema());
+
+		let subject := self._rdf_row_node();
+		let quads := [
+			_rq_rdf_quad( subject, _rq_rdf_type(), self._rdf_table_iri() ),
+		];
+
+		for ( let column in self.get_column_metadata() ) {
+			next if not self{column_data}.exists(column{name});
+			next if self._get_column(column{name}) == null;
+			quads.push(_rq_rdf_quad(
+				subject,
+				self._rdf_column_iri(column{name}),
+				self._rdf_literal_for_column(column),
+			));
+		}
+
+		for ( let quad in self._rdf_reference_quads(subject) ) {
+			quads.push(quad);
+		}
+		for ( let quad in self._rdf_extra_quads() ) {
+			quads.push(quad);
+		}
+
+		return _rq_rdf_result( quads, opts );
 	}
 
 	method _validate_unique_column ( column, value ) {
@@ -409,134 +623,6 @@ trait TableClass {
 		return null;
 	}
 
-	method _rq_search_column ( String col ) {
-		return self._column(col);
-	}
-
-	method _rq_search_deflate ( String col, value ) {
-		return self._deflate_column( col, value );
-	}
-
-	method _rq_search_operator ( String raw_op ) {
-		let op := uc raw_op;
-		return op if op eq "=";
-		return op if op eq "!=";
-		return op if op eq "<>";
-		return op if op eq "<";
-		return op if op eq "<=";
-		return op if op eq ">";
-		return op if op eq ">=";
-		return op if op eq "LIKE";
-		return op if op eq "NOT LIKE";
-		return op if op eq "ILIKE";
-		return op if op eq "IN";
-		return op if op eq "NOT IN";
-		return op if op eq "BETWEEN";
-		die "Unsupported search operator: " _ raw_op;
-	}
-
-	method _rq_search_compare ( String col, condition, Array binds ) {
-		let column := self._rq_search_column(col);
-		let sql_col := self._table_class()._sql_identifier(column{name});
-		let op := "=";
-		let value := condition;
-
-		if ( condition instanceof Array ) {
-			die "Search condition array for " _ col _
-				" needs [ operator, value ]"
-				if condition.length() ≢ 2;
-			op := self._rq_search_operator(condition[0]);
-			value := condition[1];
-		}
-
-		if ( op eq "IN" or op eq "NOT IN" ) {
-			die "Search " _ op _ " condition for " _ col _
-				" expects an Array"
-				if not ( value instanceof Array );
-			return op eq "IN" ? "0=1" : "1=1"
-				if value.length() = 0;
-			from std/string import join;
-			for ( let item in value ) {
-				binds.push( self._rq_search_deflate( col, item ) );
-			}
-			return sql_col _ " " _ op _ " (" _
-				join( ", ", value.map( → "?" ) ) _ ")";
-		}
-
-		if ( op eq "BETWEEN" ) {
-			die "Search BETWEEN condition for " _ col _
-				" expects [ low, high ]"
-				if not ( value instanceof Array )
-				or value.length() ≢ 2;
-			binds.push( self._rq_search_deflate( col, value[0] ) );
-			binds.push( self._rq_search_deflate( col, value[1] ) );
-			return sql_col _ " BETWEEN ? AND ?";
-		}
-
-		if ( value ≡ null ) {
-			return sql_col _ " IS NULL" if op eq "=";
-			return sql_col _ " IS NOT NULL" if op eq "!=" or op eq "<>";
-		}
-
-		binds.push( self._rq_search_deflate( col, value ) );
-		if ( op eq "ILIKE" ) {
-			return "LOWER(" _ sql_col _ ") LIKE LOWER(?)";
-		}
-		return sql_col _ " " _ op _ " ?";
-	}
-
-	method _rq_search_compile ( conditions, Array binds ) {
-		return "1=1" if conditions ≡ null;
-		if ( conditions instanceof Array ) {
-			return self._rq_search_compile_array( conditions, binds, "AND" );
-		}
-		if ( conditions instanceof Dict or conditions instanceof PairList ) {
-			return self._rq_search_compile_pairs( conditions, binds );
-		}
-		die "Search conditions must be Dict, PairList, or Array";
-	}
-
-	method _rq_search_compile_array (
-		Array conditions,
-		Array binds,
-		String op
-	) {
-		return "1=1" if conditions.length() = 0;
-		from std/string import join;
-		let parts := conditions.map( function ( item ) {
-			return self._rq_search_compile( item, binds );
-		} );
-		return "(" _ join( " " _ op _ " ", parts ) _ ")";
-	}
-
-	method _rq_search_compile_pairs ( conditions, Array binds ) {
-		let parts := [];
-		for ( let pair in conditions.to_Array() ) {
-			let key := pair.key;
-			let value := pair.value;
-			if ( key eq "AND" or key eq "OR" ) {
-				let group := value instanceof Array ? value : [ value ];
-				parts.push(
-					self._rq_search_compile_array( group, binds, key )
-				);
-			}
-			else if ( key eq "NOT" ) {
-				parts.push(
-					"NOT (" _ self._rq_search_compile( value, binds ) _ ")"
-				);
-			}
-			else if ( key eq "opts" ) {
-				next;
-			}
-			else {
-				parts.push( self._rq_search_compare( key, value, binds ) );
-			}
-		}
-		return "1=1" if parts.length() = 0;
-		from std/string import join;
-		return join( " AND ", parts );
-	}
-
 	method _rq_search_opts ( PairList conditions ) {
 		let opts := conditions.get( "opts", {} );
 		let clean := conditions.copy;
@@ -544,53 +630,43 @@ trait TableClass {
 		return { conditions: clean, opts: opts };
 	}
 
-	method _rq_search_order_sql ( opts ) {
-		return "" if not opts.exists("order_by");
-		let items := opts{order_by} instanceof Array
-			? opts{order_by}
-			: [ opts{order_by} ];
-		let parts := [];
-		for ( let item in items ) {
-			if ( item instanceof Array ) {
-				let direction := uc( item.length() > 1 ? item[1] : "ASC" );
-				die "Unsupported order direction: " _ direction
-					if direction ne "ASC" and direction ne "DESC";
-				parts.push(
-					self._table_class()._sql_column(item[0]) _ " " _ direction
-				);
-			}
-			else {
-				parts.push( self._table_class()._sql_column(item) _ " ASC" );
-			}
-		}
-		from std/string import join;
-		return parts.length() ? " ORDER BY " _ join( ", ", parts ) : "";
+	method _rq_build_where ( conditions ) {
+		let table_class := self._table_class();
+		return _rq_build_where(
+			conditions,
+			function ( String col ) {
+				return table_class._sql_column(col);
+			},
+			function ( String col, value ) {
+				return self._deflate_column( col, value );
+			},
+		);
 	}
 
-	method _rq_search_limit_sql ( opts, Array binds ) {
-		let sql := "";
-		if ( opts.exists("limit") ) {
-			sql _= " LIMIT ?";
-			binds.push(opts{limit});
-		}
-		if ( opts.exists("offset") ) {
-			sql _= opts.exists("limit") ? " OFFSET ?" : " LIMIT -1 OFFSET ?";
-			binds.push(opts{offset});
-		}
-		return sql;
+	method _rq_build_order ( opts ) {
+		let table_class := self._table_class();
+		return _rq_build_order(
+			opts,
+			function ( String col ) {
+				return table_class._sql_column(col);
+			},
+		);
 	}
 
 	method _rq_search_run ( conditions, opts ) {
 		from std/string import sprint;
 
-		let binds := [];
-		let where := self._rq_search_compile( conditions, binds );
+		let where := self._rq_build_where(conditions);
+		let limit := _rq_build_limit(opts);
+		let binds := where{binds};
+		for ( let value in limit{binds} ) {
+			binds.push(value);
+		}
 		let sql := sprint(
 			"SELECT * FROM %s WHERE %s",
 			self._table_class()._sql_table(),
-			where,
-		) _ self._rq_search_order_sql(opts)
-			_ self._rq_search_limit_sql( opts, binds );
+			where{sql},
+		) _ self._rq_build_order(opts) _ limit{sql};
 		let sth := self.get_schema().get_dbh().prepare(sql);
 		sth.execute( ... binds );
 
@@ -629,15 +705,14 @@ trait TableClass {
 
 	method _rq_count_run ( conditions ) {
 		from std/string import sprint;
-		let binds := [];
-		let where := self._rq_search_compile( conditions, binds );
+		let where := self._rq_build_where(conditions);
 		let sql := sprint(
 			"SELECT COUNT(*) AS rowquill_count FROM %s WHERE %s",
 			self._table_class()._sql_table(),
-			where,
+			where{sql},
 		);
 		let sth := self.get_schema().get_dbh().prepare(sql);
-		sth.execute( ... binds );
+		sth.execute( ... where{binds} );
 		return sth.next_typed_dict(){rowquill_count};
 	}
 
@@ -719,6 +794,22 @@ trait TableClass {
 	method insert_or_update () {
 		try { self.insert() } catch (e) { self.update() };
 	}
+
+	method _rq_all_as_rdf ( PairList opts ) {
+		let quads := [];
+		let search_opts := opts.get( "opts", {} );
+		for ( let row in self._rq_search_run( {}, search_opts ) ) {
+			let export_row := row;
+			if ( row._table_class()._primary_key_names().length() > 0 ) {
+				let fresh := row._table_class().find(row._primary_key_value());
+				export_row := fresh if fresh ≢ null;
+			}
+			for ( let quad in export_row.as_rdf() ) {
+				quads.push(quad);
+			}
+		}
+		return _rq_rdf_result( quads, opts );
+	}
 }
 
 class ClassMaker {
@@ -728,6 +819,8 @@ class ClassMaker {
 	let _pkey := [];
 	let _rels := [];
 	let _helpers := [];
+	let _traits := [];
+	let _rdf_hooks := [];
 	let _hooks := {
 		before_insert: [],
 		after_insert:  [],
@@ -760,12 +853,17 @@ class ClassMaker {
 		_helpers.push( opts );
 	}
 
+	method add_trait ( t ) {
+		_traits.push( t );
+	}
+
 	method before_insert ( Function cb ) { _hooks{before_insert}.push(cb); }
 	method after_insert  ( Function cb ) { _hooks{after_insert}.push(cb);  }
 	method before_update ( Function cb ) { _hooks{before_update}.push(cb); }
 	method after_update  ( Function cb ) { _hooks{after_update}.push(cb);  }
 	method before_delete ( Function cb ) { _hooks{before_delete}.push(cb); }
 	method after_delete  ( Function cb ) { _hooks{after_delete}.push(cb);  }
+	method on_rdf ( Function cb ) { _rdf_hooks.push(cb); }
 
 	method has_one ( ... PairList pl ) {
 		const opts := pl.copy;
@@ -876,14 +974,23 @@ class ClassMaker {
 
 	method make_class () {
 		const CODE := do {
-			from std/string import camel;
+			from std/string import camel, join;
 			let class_name := camel( self{table} );
 			class_name[0] := "TABLE_" _ uc class_name[0];
 
-			```
-			let _cached_pkeys;
+			let i := 0;
+			let trait_defs := "";
+			let trait_slug := "";
+			for ( const t in self{_traits} ) {
+				trait_defs _= `; const RowquillTrait${i} := TRAITS[${i}]`;
+				trait_slug _= `, RowquillTrait${i}`;
+				++i;
+			}
 
-			class ${class_name} with TableClass {
+			```
+			let _cached_pkeys${trait_defs};
+
+			class ${class_name} with TableClass${trait_slug} {
 				let column_data := {};
 				let dirty := {};
 				let in_database := false;
@@ -910,6 +1017,10 @@ class ClassMaker {
 
 				method get_hook_metadata () {
 					return HOOKS;
+				}
+
+				method get_rdf_hook_metadata () {
+					return RDF_HOOKS;
 				}
 
 				static method _schema () {
@@ -996,6 +1107,10 @@ class ClassMaker {
 					return ( new self() )._rq_all(args);
 				}
 
+				static method all_as_rdf ( ... PairList args ) {
+					return ( new self() )._rq_all_as_rdf(args);
+				}
+
 				static method first ( ... PairList conditions ) {
 					return ( new self() )._rq_first(conditions);
 				}
@@ -1035,7 +1150,8 @@ class ClassMaker {
 		const RELATIONSHIPS := self{_rels};
 		const HELPERS    := self{_helpers};
 		const HOOKS      := self{_hooks};
+		const TRAITS     := self{_traits};
+		const RDF_HOOKS  := self{_rdf_hooks};
 		return eval( CODE );
 	}
 }
-

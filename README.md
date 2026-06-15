@@ -103,7 +103,10 @@ say( bob.is_accountant() );          // true
 - `has_one` and `has_many` relationships with multi-column joins and
   optional search-style `where` filters.
 - Assigning `has_one` relationships with `relationship(set: row)`.
+- Optional RDF export using the W3C Direct Mapping shape when the `rdf`
+  distribution is available.
 - Custom row helper methods and static table-class methods.
+- Custom traits composed into generated row classes.
 - Lifecycle hooks for insert, update, and delete.
 - Schema registry helpers: `has_table` and `table_names`.
 - Schema-level `create`, `find`, `search`, and `insert` shortcuts for
@@ -206,6 +209,50 @@ bob.department( set: accounts );
 `has_many` relationships and relationships with `where` filters cannot be
 assigned this way.
 
+## RDF Export
+
+If the optional `rdf` distribution is available, Rowquill rows and tables
+can be exported as RDF quads using the W3C Direct Mapping shape.
+
+```zzs
+from rdf import RDFStore;
+
+let schema := new Schema(
+	dbh: DB.temp(),
+	base_uri: "http://foo.example/DB/",
+);
+
+let bob := schema.table("employee").find(42);
+let quads := bob.as_rdf();
+
+let store := RDFStore.temp();
+store.install_schema();
+bob.as_rdf( into: store );
+schema.table("employee").all_as_rdf( into: store );
+schema.all_as_rdf( into: store );
+```
+
+RDF export uses Rowquill's table classes as the source of truth. Columns
+marked with `primary: true` identify rows, column metadata supplies literal
+predicates, and `has_one` relationships generate `#ref-...` predicates when
+all local join columns are non-null. If `rdf` is unavailable or the schema
+has no `base_uri`, RDF export throws a runtime error.
+
+Tables can append custom RDF quads with `on_rdf`. The callback receives the
+row and must return an array of quads.
+
+```zzs
+tab.on_rdf( function ( employee ) {
+	return [
+		rdf_quad(
+			employee._rdf_row_node(),
+			rdf_iri("http://example.com/audit"),
+			rdf_literal("custom"),
+		),
+	];
+} );
+```
+
 ## Helper Methods
 
 `add_helper` adds a method to generated row objects. The callback
@@ -231,6 +278,25 @@ tab.add_static( "in_department", function ( Employee, String department ) {
 } );
 
 schema.table("employee").in_department("Accounts");
+```
+
+`add_trait` composes a custom trait into the generated row class. Traits are
+useful when several tables should share row-object behaviour.
+
+```zzs
+trait HasSlug {
+	method slug () {
+		return lc self.name();
+	}
+}
+
+schema.add_table( "department", function ( tab ) {
+	tab.add_trait( HasSlug );
+	tab.add_column( "id", "int", primary: true );
+	tab.add_column( "name", "varchar", required: true );
+} );
+
+schema.table("department").find(1).slug();
 ```
 
 ## Column Options

@@ -1,0 +1,34 @@
+from db/rowquill import Schema;
+from std/data/json import JSON;
+from std/db import DB;
+from test/more import *;
+
+const schema := new Schema( dbh: DB.temp() );
+
+schema.get_dbh().prepare("""
+	CREATE TABLE department (
+		id int,
+		name varchar(200),
+		PRIMARY KEY (id)
+	);
+""").execute();
+
+trait UcName {
+	method uc_name () {
+		return uc self.name();
+	}
+}
+
+schema.add_table( "department", function ( tab ) {
+	tab.add_trait( UcName );
+	tab.add_column( "id", "int", primary: true );
+	tab.add_column( "name", "varchar", "length": 200, required: true );
+} );
+
+let Department := schema.table("department");
+let accounts   := Department.create( id: 1, name: "Accounts" );
+
+is( accounts.uc_name(), "ACCOUNTS" );
+ok( accounts does UcName );
+
+done_testing();

@@ -1,6 +1,6 @@
 {
 	"name": "rowquill",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"author": "Toby Inkster",
 	"repo": "https://github.com/tobyink/zuzu-rowquill",
 	"license": "Artistic-1.0 OR GPL-2.0-or-later",
@@ -9,6 +9,7 @@
 	"dependencies": {
 		"std/db": "0",
 		"std/eval": "0",
+		"std/net/url": "0",
 		"std/string": "0"
 	}
 }

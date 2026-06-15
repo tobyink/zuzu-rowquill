@@ -1,0 +1,237 @@
+=encoding utf8
+
+=head1 NAME
+
+db/rowquill/sqlbuilder - SQL builders for Rowquill.
+
+=head1 SYNOPSIS
+
+  from db/rowquill/sqlbuilder import build_limit, build_order, build_where;
+  from std/db import DB;
+  
+  let dbh := DB.connect("...");
+  let where := build_where( { name: [ "ILIKE", "%rob%" ] } );
+  let order := build_order( { order_by: [ [ "name", "ASC" ] ] } );
+  let limit := build_limit( { limit: 20, page: 2 } );
+  let binds := where{binds};
+  for ( let value in limit{binds} ) {
+    binds.push(value);
+  }
+  
+  let sth := dbh.prepare(
+    `SELECT * FROM people WHERE ${where{sql}}${order}${limit{sql}}`
+  );
+  sth.execute( binds );
+  
+  while ( let row := sth.next_typed_dict() ) {
+    ...;
+  }
+
+=head1 DESCRIPTION
+
+C<build_where> turns Rowquill search condition data structures into a SQL
+C<WHERE> fragment plus bind values. C<build_order> builds an C<ORDER BY>
+fragment, and C<build_limit> builds a C<LIMIT>/C<OFFSET> fragment plus bind
+values. C<build_limit> also accepts C<page> as an alternative to C<offset>,
+calculating the offset as C<( page - 1 ) * limit>. Callers can supply
+callbacks for column quoting and value deflation.
+
+=head1 COPYRIGHT AND LICENCE
+
+B<< db/rowquill/sqlbuilder >> is copyright Toby Inkster.
+
+It is free software; you may redistribute it and/or modify it under
+the terms of either the Artistic License 1.0 or the GNU General Public
+License version 2.
+
+=cut
+
+from std/string import join;
+
+class _WhereBuilder {
+	let Function column_sql;
+	let Function deflate;
+	let Array binds := [];
+
+	method _operator ( String raw_op ) {
+		let op := uc raw_op;
+		return op if op eq "=";
+		return op if op eq "!=";
+		return op if op eq "<>";
+		return op if op eq "<";
+		return op if op eq "<=";
+		return op if op eq ">";
+		return op if op eq ">=";
+		return op if op eq "LIKE";
+		return op if op eq "NOT LIKE";
+		return op if op eq "ILIKE";
+		return op if op eq "IN";
+		return op if op eq "NOT IN";
+		return op if op eq "BETWEEN";
+		die "Unsupported search operator: " _ raw_op;
+	}
+
+	method _compare ( String col, condition ) {
+		let sql_col := column_sql(col);
+		let op := "=";
+		let value := condition;
+
+		if ( condition instanceof Array ) {
+			die "Search condition array for " _ col _
+				" needs [ operator, value ]"
+				if condition.length() ≢ 2;
+			op := self._operator(condition[0]);
+			value := condition[1];
+		}
+
+		if ( op eq "IN" or op eq "NOT IN" ) {
+			die "Search " _ op _ " condition for " _ col _
+				" expects an Array"
+				if not ( value instanceof Array );
+			return op eq "IN" ? "0=1" : "1=1"
+				if value.length() = 0;
+			for ( let item in value ) {
+				binds.push( deflate( col, item ) );
+			}
+			return sql_col _ " " _ op _ " (" _
+				join(
+					", ",
+					value.map( function ( item ) { return "?"; } )
+				) _
+				")";
+		}
+
+		if ( op eq "BETWEEN" ) {
+			die "Search BETWEEN condition for " _ col _
+				" expects [ low, high ]"
+				if not ( value instanceof Array )
+				or value.length() ≢ 2;
+			binds.push( deflate( col, value[0] ) );
+			binds.push( deflate( col, value[1] ) );
+			return sql_col _ " BETWEEN ? AND ?";
+		}
+
+		if ( value ≡ null ) {
+			return sql_col _ " IS NULL" if op eq "=";
+			return sql_col _ " IS NOT NULL" if op eq "!=" or op eq "<>";
+		}
+
+		binds.push( deflate( col, value ) );
+		if ( op eq "ILIKE" ) {
+			return "LOWER(" _ sql_col _ ") LIKE LOWER(?)";
+		}
+		return sql_col _ " " _ op _ " ?";
+	}
+
+	method _compile_array ( Array conditions, String op ) {
+		return "1=1" if conditions.length() = 0;
+		let parts := conditions.map( function ( item ) {
+			return self._compile(item);
+		} );
+		return "(" _ join( " " _ op _ " ", parts ) _ ")";
+	}
+
+	method _compile_pairs ( conditions ) {
+		let parts := [];
+		for ( let pair in conditions.to_Array() ) {
+			let key := pair.key;
+			let value := pair.value;
+			if ( key eq "AND" or key eq "OR" ) {
+				let group := value instanceof Array ? value : [ value ];
+				parts.push( self._compile_array( group, key ) );
+			}
+			else if ( key eq "NOT" ) {
+				parts.push( "NOT (" _ self._compile(value) _ ")" );
+			}
+			else if ( key eq "opts" ) {
+				next;
+			}
+			else {
+				parts.push( self._compare( key, value ) );
+			}
+		}
+		return "1=1" if parts.length() = 0;
+		return join( " AND ", parts );
+	}
+
+	method _compile ( conditions ) {
+		return "1=1" if conditions ≡ null;
+		if ( conditions instanceof Array ) {
+			return self._compile_array( conditions, "AND" );
+		}
+		if ( conditions instanceof Dict or conditions instanceof PairList ) {
+			return self._compile_pairs(conditions);
+		}
+		die "Search conditions must be Dict, PairList, or Array";
+	}
+
+	method build ( conditions ) {
+		return {
+			sql:   self._compile(conditions),
+			binds: binds,
+		};
+	}
+}
+
+function _default_column_sql ( col ) {
+	return `"${col}"`;
+}
+
+function _default_deflate ( col, val ) {
+	return val;
+}
+
+function build_where (
+	conditions,
+	Function column_sql?,
+	Function deflate?,
+) {
+	return ( new _WhereBuilder(
+		column_sql: column_sql ?: _default_column_sql,
+		deflate:    deflate    ?: _default_deflate,
+	) ).build(conditions);
+}
+
+function build_order ( opts, Function column_sql? ) {
+	let col_sql := column_sql ?: _default_column_sql;
+	return "" if opts ≡ null or not opts.exists("order_by");
+	let items := opts{order_by} instanceof Array
+		? opts{order_by}
+		: [ opts{order_by} ];
+	let parts := [];
+	for ( let item in items ) {
+		if ( item instanceof Array ) {
+			let direction := uc( item.length() > 1 ? item[1] : "ASC" );
+			die "Unsupported order direction: " _ direction
+				if direction ne "ASC" and direction ne "DESC";
+			parts.push( col_sql(item[0]) _ " " _ direction );
+		}
+		else {
+			parts.push( col_sql(item) _ " ASC" );
+		}
+	}
+	return parts.length() ? " ORDER BY " _ join( ", ", parts ) : "";
+}
+
+function build_limit ( opts ) {
+	let sql := "";
+	let binds := [];
+	return { sql: sql, binds: binds } if opts ≡ null;
+	die "build_limit page cannot be combined with offset"
+		if opts.exists("page") and opts.exists("offset");
+	die "build_limit page requires limit"
+		if opts.exists("page") and not opts.exists("limit");
+	if ( opts.exists("limit") ) {
+		sql _= " LIMIT ?";
+		binds.push(opts{limit});
+	}
+	if ( opts.exists("page") ) {
+		sql _= " OFFSET ?";
+		binds.push(( opts{page} - 1 ) * opts{limit});
+	}
+	else if ( opts.exists("offset") ) {
+		sql _= opts.exists("limit") ? " OFFSET ?" : " LIMIT -1 OFFSET ?";
+		binds.push(opts{offset});
+	}
+	return { sql: sql, binds: binds };
+}

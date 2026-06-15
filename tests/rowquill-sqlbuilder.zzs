@@ -1,0 +1,200 @@
+from db/rowquill/sqlbuilder import build_limit, build_order, build_where;
+from test/more import *;
+
+function column_sql ( String col ) {
+	return "\"" _ col _ "\"";
+}
+
+function deflate ( String col, value ) {
+	return value;
+}
+
+let simple := build_where(
+	{ name: "Bob" },
+	column_sql,
+	deflate,
+);
+
+is(
+	simple{sql},
+	"\"name\" = ?",
+	"build_where compiles simple equality conditions",
+);
+ok(
+	simple{binds} == [ "Bob" ],
+	"build_where returns bind values",
+);
+
+let default_where := build_where( { name: "Bob" } );
+
+is(
+	default_where{sql},
+	"\"name\" = ?",
+	"build_where has default column quoting",
+);
+
+let null_condition := build_where(
+	{ deleted: null },
+	column_sql,
+	deflate,
+);
+
+is(
+	null_condition{sql},
+	"\"deleted\" IS NULL",
+	"build_where compiles null conditions",
+);
+
+let nested := build_where(
+	{
+		OR: [
+			{ name: [ "ILIKE", "%bob%" ] },
+			{ AND: [
+				{ id: [ "IN", [ 1, 2 ] ] },
+				{ dept: [ "BETWEEN", [ 10, 20 ] ] },
+			] },
+		],
+		opts: { limit: 10 },
+	},
+	column_sql,
+	deflate,
+);
+
+is(
+	nested{sql},
+	"(" _
+	"LOWER(\"name\") LIKE LOWER(?)" _
+	" OR " _
+	"(\"id\" IN (?, ?) AND \"dept\" BETWEEN ? AND ?)" _
+	")",
+	"build_where compiles nested condition groups",
+);
+ok(
+	nested{binds} == [ "%bob%", 1, 2, 10, 20 ],
+	"build_where returns nested bind values in SQL order",
+);
+
+let negated := build_where(
+	{ NOT: { name: null } },
+	column_sql,
+	deflate,
+);
+
+is(
+	negated{sql},
+	"NOT (\"name\" IS NULL)",
+	"build_where compiles NOT groups",
+);
+
+let empty_in := build_where(
+	{ id: [ "IN", [] ] },
+	column_sql,
+	deflate,
+);
+
+is(
+	empty_in{sql},
+	"0=1",
+	"build_where compiles empty IN as false",
+);
+
+like(
+	exception( function () {
+		build_where(
+			{ id: [ "NOPE", 1 ] },
+			column_sql,
+			deflate,
+		);
+	} ),
+	/Unsupported search operator/,
+	"build_where rejects unsupported operators",
+);
+
+is(
+	build_order(
+		{ order_by: [ [ "name", "DESC" ], "id" ] },
+		column_sql,
+	),
+	" ORDER BY \"name\" DESC, \"id\" ASC",
+	"build_order compiles order clauses",
+);
+
+is(
+	build_order( { order_by: "name" } ),
+	" ORDER BY \"name\" ASC",
+	"build_order has default column quoting",
+);
+
+like(
+	exception( function () {
+		build_order( { order_by: [ [ "name", "SIDEWAYS" ] ] }, column_sql );
+	} ),
+	/Unsupported order direction/,
+	"build_order rejects unsupported directions",
+);
+
+let limit := build_limit( { limit: 20, offset: 40 } );
+
+is(
+	limit{sql},
+	" LIMIT ? OFFSET ?",
+	"build_limit compiles limit and offset",
+);
+ok(
+	limit{binds} == [ 20, 40 ],
+	"build_limit returns bind values",
+);
+
+let offset := build_limit( { offset: 40 } );
+
+is(
+	offset{sql},
+	" LIMIT -1 OFFSET ?",
+	"build_limit compiles offset without limit",
+);
+ok(
+	offset{binds} == [ 40 ],
+	"build_limit returns offset bind values",
+);
+
+let first_page := build_limit( { limit: 10, page: 1 } );
+
+is(
+	first_page{sql},
+	" LIMIT ? OFFSET ?",
+	"build_limit compiles first page",
+);
+ok(
+	first_page{binds} == [ 10, 0 ],
+	"build_limit calculates first page offset",
+);
+
+let second_page := build_limit( { limit: 10, page: 2 } );
+
+is(
+	second_page{sql},
+	" LIMIT ? OFFSET ?",
+	"build_limit compiles later pages",
+);
+ok(
+	second_page{binds} == [ 10, 10 ],
+	"build_limit calculates later page offsets",
+);
+
+like(
+	exception( function () {
+		build_limit( { limit: 10, page: 1, offset: 20 } );
+	} ),
+	/page cannot be combined with offset/,
+	"build_limit rejects page with offset",
+);
+
+like(
+	exception( function () {
+		build_limit( { page: 1 } );
+	} ),
+	/page requires limit/,
+	"build_limit rejects page without limit",
+);
+
+done_testing();

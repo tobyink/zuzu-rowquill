@@ -74,6 +74,43 @@ C<relationship(set: row)>; this copies every join column from the related
 row. C<has_many> relationships and relationships with C<where> filters
 cannot be assigned this way.
 
+=head2 RDF Export
+
+When the optional C<rdf> distribution is available, C<as_rdf> exports a row
+as RDF quads using the W3C Direct Mapping shape. C<all_as_rdf> on a table
+class exports every row in that table, and C<Schema.all_as_rdf> exports every
+registered table. Passing C<into: store> adds the quads to an RDF store and
+returns the store.
+
+  let schema := new Schema(
+      dbh: DB.temp(),
+      base_uri: "http://foo.example/DB/",
+  );
+
+  let quads := schema.table("employee").find(42).as_rdf();
+  schema.table("employee").all_as_rdf( into: store );
+  schema.all_as_rdf( into: store );
+
+RDF export uses Rowquill metadata as the schema source of truth. Columns
+marked with C<primary: true> identify rows, non-null column values become
+literal triples, and C<has_one> relationships generate C<#ref-> predicates
+when all local join columns are non-null. If C<rdf> is unavailable or the
+schema has no C<base_uri>, RDF export throws a runtime error.
+
+C<on_rdf> registers a table-level callback for additional RDF quads. The
+callback receives the row and must return an array of quads to append to the
+default generated quads.
+
+  tab.on_rdf( function ( employee ) {
+      return [
+          rdf_quad(
+              employee._rdf_row_node(),
+              rdf_iri("http://example.com/audit"),
+              rdf_literal("custom"),
+          ),
+      ];
+  } );
+
 =head2 Helper Methods
 
 C<add_helper> adds an instance method to generated row objects. The
@@ -90,6 +127,17 @@ callback receives the table class as its first argument.
   tab.add_static( "named", function ( Employee, String name ) {
       return Employee.search( name: name );
 	  } );
+
+C<add_trait> composes a custom trait into the generated row class. Traits
+are useful when several tables should share row-object behaviour.
+
+  trait HasSlug {
+      method slug () {
+          return lc self.name();
+      }
+  }
+
+  tab.add_trait( HasSlug );
 
 =head2 Column Options
 
@@ -137,12 +185,27 @@ License version 2.
 =cut
 
 from db/rowquill/tableclass import ClassMaker as _RowquillClassMaker;
+from rdf try import rdf_iri as _RowquillRdfProbe;
+
+function _rowquill_rdf_require () {
+	die "db/rowquill RDF export requires optional module rdf"
+		if _RowquillRdfProbe ≡ null;
+	return true;
+}
+
+function _rowquill_rdf_require_base ( schema ) {
+	die "db/rowquill RDF export requires Schema.base_uri"
+		if schema.get_base_uri() ≡ null
+		or "" _ schema.get_base_uri() eq "";
+	return true;
+}
 
 class ClassMaker extends _RowquillClassMaker;
 
 class Schema {
 	let _tables := {};
 	let dbh with get, set;
+	let base_uri with get, set := null;
 	let _transaction_depth := 0;
 	let _savepoint_seq := 0;
 
@@ -183,6 +246,23 @@ class Schema {
 		let row := self.create( tablename, ...opts );
 		row.insert();
 		return row;
+	}
+
+	method all_as_rdf ( ... PairList opts ) {
+		_rowquill_rdf_require();
+		_rowquill_rdf_require_base(self);
+
+		let quads := [];
+		for ( let tablename in self.table_names() ) {
+			for ( let quad in self.table(tablename).all_as_rdf() ) {
+				quads.push(quad);
+			}
+		}
+		if ( opts.exists("into") ) {
+			opts{into}.add_quads(quads);
+			return opts{into};
+		}
+		return quads;
 	}
 
 	method _exec_sql ( String sql ) {
