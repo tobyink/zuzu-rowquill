@@ -16,8 +16,7 @@ db/rowquill - Small row-object ORM for ZuzuScript.
       tab.add_column( "name", "varchar", required: true );
   } );
 
-  let bob := schema.table("employee").create( id: 1, name: "Bob" );
-  bob.insert();
+  let bob := schema.table("employee").insert_new( id: 1, name: "Bob" );
 
   say( schema.table("employee").find(1).name() );
 
@@ -25,8 +24,8 @@ db/rowquill - Small row-object ORM for ZuzuScript.
 
 C<db/rowquill> is a small row-object ORM for ZuzuScript. A C<Schema>
 wraps a C<std/db> database handle and builds one generated class per
-table. Generated row classes support C<create>, C<find>, C<search>,
-C<insert>, C<update>, C<delete>, column accessors, inflate/deflate
+table. Generated row classes support C<create>, C<insert_new>, C<find>,
+C<search>, C<insert>, C<update>, C<delete>, column accessors, inflate/deflate
 callbacks, validation, and simple C<has_one> and C<has_many>
 relationships. Table builders can also add custom row helper methods
 and static table-class helper methods.

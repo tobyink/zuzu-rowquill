@@ -228,6 +228,19 @@ like(
 	/must be unique/,
 	"unique columns reject duplicate database values",
 );
+let inserted_new := schema.table("employee").insert_new(
+	id: 48,
+	fullname: "Inserted New",
+	email: "insert-new@example.com",
+);
+is( inserted_new{in_database}, true, "insert_new writes a new row" );
+is( inserted_new{dirty}, {}, "insert_new returns a clean row" );
+is(
+	schema.table("employee").find(48).name(),
+	"Inserted New",
+	"insert_new row can be found",
+);
+inserted_new.delete();
 like(
 	exception( function () {
 		schema.table("employee").create(

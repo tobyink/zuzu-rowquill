@@ -71,14 +71,13 @@ let accounts := schema.table("department").create(
 );
 accounts.insert();
 
-let bob := schema.table("employee").create(
+let bob := schema.table("employee").insert_new(
 	id: 42,
 	name: "Bob",
 	dept: 3,
 	company: "ACME",
 	is_deleted: false,
 );
-bob.insert();
 
 say( bob.department().name() );      // Accounts
 say( accounts.employees()[0].name() ); // Bob
@@ -87,7 +86,7 @@ say( bob.is_accountant() );          // true
 
 ## Features
 
-- `create`, `find`, `search`, `all`, `first`, `count`, `exists`,
+- `create`, `insert_new`, `find`, `search`, `all`, `first`, `count`, `exists`,
   `find_or_create`, `create_or_update`, `insert`, `update`,
   `insert_or_update`, and `delete`.
 - Generated column accessors with optional alternate names.

@@ -1072,6 +1072,12 @@ class ClassMaker {
 					return self._create_from(opts);
 				}
 
+				static method insert_new ( ... PairList opts ) {
+					let row := self.create( ...opts );
+					row.insert();
+					return row;
+				}
+
 				static method _create_from ( data ) {
 					let i := new self();
 					for ( data.to_Array() ) {
